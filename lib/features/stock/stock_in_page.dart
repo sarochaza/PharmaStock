@@ -1029,19 +1029,7 @@ void _showSupplierPickerSheet() {
         backgroundColor: cs.primary,
         foregroundColor: Colors.white,
         title: const Text('รับยาเข้า'),
-        actions: [
-          IconButton(
-            tooltip: 'ประวัติ',
-            onPressed: () => _toast('TODO: เปิดหน้าประวัติรับยาเข้า'),
-            icon: const Icon(Icons.receipt_long_rounded),
-          ),
-          IconButton(
-            tooltip: 'กลับ',
-            onPressed: () => Navigator.maybePop(context),
-            icon: const Icon(Icons.arrow_back_rounded),
-          ),
-          const SizedBox(width: 8),
-        ],
+        
       ),
       body: SafeArea(
         child: Center(

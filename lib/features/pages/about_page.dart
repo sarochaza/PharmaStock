@@ -8,10 +8,10 @@ class AboutPage extends StatelessWidget {
     final cs = Theme.of(context).colorScheme;
 
     // ✅ ถ้าคุณอยากดึง version จริงทีหลัง ค่อยเพิ่ม package_info_plus ได้
-    const appName = 'Phamory';
+    const appName = 'PharmaStock';
     const version = '1.1';
-    const developer = 'Phamory Team';
-    const contact = 'sarochax123@gmail.com';
+    const developer = 'PharmaStock Team';
+    const contact = 'Sarocha.sao@kkumail.com';
 
     return Scaffold(
       backgroundColor: const Color(0xFFF4F7FB),
@@ -71,7 +71,11 @@ class AboutPage extends StatelessWidget {
                         Text('ช่องทางติดต่อ: $contact', style: const TextStyle(fontWeight: FontWeight.w700)),
                         const SizedBox(height: 12),
                         Text(
-                          'Phamory คือระบบจัดการคลังยา: รับเข้า • จ่ายออก • เตือนหมดอายุ • รายงาน',
+                          '''PharmaStock เป็นระบบบริหารจัดการสต๊อกยา ที่ออกแบบมาเพื่อช่วยร้านขายยา คลินิก และธุรกิจด้านเวชภัณฑ์ ให้สามารถควบคุมปริมาณยา ตรวจสอบวันหมดอายุ และติดตามการรับ–จ่ายสินค้าได้อย่างเป็นระบบและมีประสิทธิภาพ
+
+แอปพลิเคชันนี้พัฒนาขึ้นเพื่อแก้ปัญหาการจัดการสต๊อกแบบดั้งเดิม ลดความผิดพลาดในการบันทึกข้อมูล และเพิ่มความสะดวกในการตรวจสอบข้อมูลแบบเรียลไทม์ โดยรองรับการทำงานผ่านระบบคลาวด์ ทำให้ผู้ใช้งานสามารถเข้าถึงข้อมูลได้ทุกที่ ทุกเวลา
+
+PharmaStock มุ่งเน้นความถูกต้อง ความปลอดภัยของข้อมูล และการใช้งานที่เข้าใจง่าย เพื่อสนับสนุนการบริหารจัดการเวชภัณฑ์ให้เป็นไปอย่างมืออาชีพ และช่วยลดความเสี่ยงจากการขาดสต๊อกหรือการจำหน่ายยาที่หมดอายุ''',
                           style: TextStyle(color: Colors.black.withOpacity(0.65), height: 1.4),
                         ),
                       ],

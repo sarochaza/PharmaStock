@@ -1,15 +1,21 @@
+// lib/pages/stock/stock_out_page.dart
+import 'dart:async';
 import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
-import 'dart:async';
+
 import '../../core/supabase_guard.dart';
 
-// ✅ patients (ตามโครงในรูปของคุณ)
+// ✅ patients
 import '../../core/patients/patient_repository.dart';
 import '../../core/patients/patient_model.dart';
 import '../../core/patients/patient_picker.dart';
 import '../../core/patients/add_edit_patient_page.dart';
 import '../../core/patients/patient_detail_page.dart';
+
+// ✅ NEW: ประวัติการจ่าย/สั่งซื้อของคนไข้
+import '../../core/patients/patient_orders_history_page.dart';
 
 class StockOutPage extends StatefulWidget {
   const StockOutPage({super.key});
@@ -32,6 +38,9 @@ class _StockOutPageState extends State<StockOutPage> {
 
   num _availableBase = 0;
 
+  // ✅ example_text from drugs
+  String? _drugExampleText;
+
   // Search
   final TextEditingController _searchCtl = TextEditingController();
   String _q = '';
@@ -49,7 +58,7 @@ class _StockOutPageState extends State<StockOutPage> {
   List<_LotPricePreview> _pricePreview = [];
 
   // ===============================
-  // ✅ Patients state (NEW)
+  // ✅ Patients state
   // ===============================
   PatientRepository? _patientRepo;
   bool _loadingPatients = false;
@@ -109,7 +118,7 @@ class _StockOutPageState extends State<StockOutPage> {
     setState(() => _loading = true);
     try {
       await _loadDrugs();
-      await _loadPatients(); // ✅ NEW
+      await _loadPatients();
     } catch (e) {
       _toast('โหลดข้อมูลไม่สำเร็จ: $e');
     } finally {
@@ -118,7 +127,7 @@ class _StockOutPageState extends State<StockOutPage> {
   }
 
   // ===============================
-  // ✅ Patients loader (NEW)
+  // ✅ Patients loader
   // ===============================
   Future<void> _loadPatients() async {
     if (_patientRepo == null) return;
@@ -134,13 +143,37 @@ class _StockOutPageState extends State<StockOutPage> {
     }
   }
 
-  // โหลดรายการยา: เอา code มาด้วยเพื่อค้นหา
+  // ===============================
+  // ✅ Load drug example_text
+  // ===============================
+  Future<void> _loadDrugExampleText(String drugId) async {
+    try {
+      final ownerId = _ownerId();
+      final row = await _client
+          .from('drugs')
+          .select('example_text')
+          .eq('owner_id', ownerId)
+          .eq('id', drugId)
+          .maybeSingle();
+
+      if (!mounted) return;
+      final t = (row?['example_text'] ?? '').toString().trim();
+      setState(() => _drugExampleText = t.isEmpty ? null : t);
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _drugExampleText = null);
+    }
+  }
+
+  // ===============================
+  // ✅ Load drugs (include category)
+  // ===============================
   Future<void> _loadDrugs() async {
     final ownerId = _ownerId();
 
     final rows = await _client
         .from('drugs')
-        .select('id, generic_name, code, base_unit')
+        .select('id, generic_name, code, base_unit, category')
         .eq('owner_id', ownerId)
         .order('generic_name', ascending: true);
 
@@ -150,6 +183,7 @@ class _StockOutPageState extends State<StockOutPage> {
               name: (r['generic_name'] ?? '').toString(),
               code: (r['code'] ?? '').toString(),
               baseUnit: (r['base_unit'] ?? '').toString(),
+              category: (r['category'] ?? '').toString().trim().isEmpty ? null : r['category'].toString(),
             ))
         .where((d) => d.id.isNotEmpty && d.name.trim().isNotEmpty)
         .toList();
@@ -181,15 +215,16 @@ class _StockOutPageState extends State<StockOutPage> {
       _availableBase = 0;
       _qtyCtrl.text = '';
 
-      // reset price preview
       _suggestedSellPerBase = null;
       _pricePreview = [];
-      // ไม่ล้าง priceCtrl เพื่อให้เด้งอัตโนมัติจาก recalculation ต่อ
+
+      _drugExampleText = null;
     });
 
     await Future.wait([
       _loadUnitsForDrug(drugId: drug.id, baseUnit: drug.baseUnit),
       _loadAvailableBase(drug.id),
+      _loadDrugExampleText(drug.id),
     ]);
 
     if (!mounted) return;
@@ -198,7 +233,6 @@ class _StockOutPageState extends State<StockOutPage> {
       _selectedUnit = _units.isNotEmpty ? _units.first : null;
     });
 
-    // ✅ หลังเลือกยา -> คำนวณราคาตาม FEFO (แต่ต้องมี qty ก่อน)
     await _recalcSuggestedPrice();
   }
 
@@ -221,7 +255,7 @@ class _StockOutPageState extends State<StockOutPage> {
           .select('unit_name, to_base, is_default, is_active')
           .eq('owner_id', ownerId)
           .eq('drug_id', drugId)
-          .eq('is_active', true)
+          .or('is_active.is.null,is_active.eq.true')
           .order('is_default', ascending: false)
           .order('to_base', ascending: true);
 
@@ -253,7 +287,7 @@ class _StockOutPageState extends State<StockOutPage> {
     setState(() => _units = merged);
   }
 
-  // ✅ FIX: คงเหลือฐาน อ่านจาก qty_on_hand_base เท่านั้น
+  // ✅ คงเหลือฐาน อ่านจาก qty_on_hand_base เท่านั้น
   Future<void> _loadAvailableBase(String drugId) async {
     final ownerId = _ownerId();
 
@@ -287,7 +321,8 @@ class _StockOutPageState extends State<StockOutPage> {
     final qtyBase = qtyInUnit * unit.toBase;
     if (qtyBase <= 0) return _toast('จำนวนที่จ่ายไม่ถูกต้อง');
 
-    final alreadyBase = _cart.where((x) => x.drugId == drug.id).fold<num>(0, (p, e) => p + e.qtyBase);
+    final alreadyBase =
+        _cart.where((x) => x.drugId == drug.id).fold<num>(0, (p, e) => p + e.qtyBase);
 
     if (alreadyBase + qtyBase > _availableBase) {
       return _toast('สต็อกไม่พอ (คงเหลือฐาน: ${_fmtNum(_availableBase)})');
@@ -353,7 +388,6 @@ class _StockOutPageState extends State<StockOutPage> {
   // ✅ PRICE: FEFO LOT-BASED + fallback latest-drug price
   // ===============================
 
-  // C2 fallback: ราคาล่าสุดของยา (ไม่ดูล็อต)
   Future<num?> _loadLatestSellPerBaseForDrug(String drugId) async {
     final ownerId = _ownerId();
 
@@ -373,7 +407,6 @@ class _StockOutPageState extends State<StockOutPage> {
     return null;
   }
 
-  // ราคาล่าสุด "ต่อล็อต" (lot_no + exp_date)
   Future<Map<String, num>> _loadLatestSellPerBaseByLot({
     required String ownerId,
     required String drugId,
@@ -390,7 +423,7 @@ class _StockOutPageState extends State<StockOutPage> {
     if (rows is List) {
       for (final r in rows) {
         final lotNo = (r['lot_no'] ?? '').toString();
-        final expDate = (r['exp_date'] ?? '').toString(); // YYYY-MM-DD
+        final expDate = (r['exp_date'] ?? '').toString();
         final sell = r['sell_per_base'];
         if (lotNo.isEmpty || expDate.isEmpty) continue;
         if (sell is! num) continue;
@@ -485,158 +518,116 @@ class _StockOutPageState extends State<StockOutPage> {
   // SAVE
   // ===============================
 
- // ใส่บนสุดไฟล์ด้วย (ถ้ายังไม่มี)
-
-
-
-// ...
-
-Future<void> _saveAll() async {
-  if (_cart.isEmpty) {
-    _toast('ยังไม่มีรายการในตะกร้า');
-    return;
-  }
-  if (_saving) {
-    _toast('กำลังบันทึกอยู่...');
-    return;
-  }
-
-  setState(() => _saving = true);
-
-  try {
-    final ownerId = _ownerId();
-
-    debugPrint('=== STOCK_OUT SAVE START ===');
-    debugPrint('ownerId=$ownerId cart=${_cart.length}');
-
-    final nowIso = DateTime.now().toIso8601String();
-
-    // 1) create receipt  ✅ ใส่ sold_at / (optional) patient_id
-    final receipt = await _client
-        .from('stock_out_receipts')
-        .insert({
-          'owner_id': ownerId,
-
-          // ถ้าตารางคุณมี patient_id ให้เปิดใช้บรรทัดนี้ (แนะนำ)
-          // 'patient_id': _selectedPatient?.id,
-
-          'patient_name': _patientCtrl.text.trim().isEmpty
-              ? (_selectedPatient?.fullName) // เผื่อเลือก patient แต่ไม่ได้พิมพ์
-              : _patientCtrl.text.trim(),
-
-          'note': _noteCtrl.text.trim().isEmpty ? null : _noteCtrl.text.trim(),
-
-          // ✅ สำคัญมาก: ทำให้ StockPage/History ที่ order/filter sold_at เห็นข้อมูลทันที
-          'sold_at': nowIso,
-        })
-        .select('id')
-        .single()
-        .timeout(const Duration(seconds: 15));
-
-    final receiptId = (receipt['id'] ?? '').toString();
-    debugPrint('Receipt created: $receiptId');
-
-    // 2) lines -> allocate lots -> insert items -> update lots
-    for (final line in _cart) {
-      debugPrint(
-          'Line drug=${line.drugId} needBase=${line.qtyBase} sellPerBase=${line.sellPerBase}');
-
-      final allocations = await _allocateLotsFEFO(
-        ownerId: ownerId,
-        drugId: line.drugId,
-        needBase: line.qtyBase,
-      ).timeout(const Duration(seconds: 15));
-
-      final allocatedSum =
-          allocations.fold<num>(0, (p, a) => p + a.qtyBase);
-      if (allocatedSum < line.qtyBase) {
-        throw Exception(
-          'สต็อกไม่พอสำหรับ ${line.drugName} (ต้องการ ${line.qtyBase} ฐาน แต่มี ${allocatedSum} ฐาน)',
-        );
-      }
-
-      for (final a in allocations) {
-        final lineTotal = a.qtyBase * line.sellPerBase;
-
-        debugPrint(
-            '  lot=${a.lotNo} exp=${a.expDate} take=${a.qtyBase} newBase=${a.newQtyOnHandBase}');
-
-        await _client
-            .from('stock_out_items')
-            .insert({
-              'owner_id': ownerId,
-              'receipt_id': receiptId,
-              'drug_id': line.drugId,
-              'lot_no': a.lotNo,
-              'exp_date': a.expDate, // YYYY-MM-DD ok
-              'qty_base': a.qtyBase,
-              'sell_per_base': line.sellPerBase,
-              'line_total': lineTotal,
-            })
-            .timeout(const Duration(seconds: 15));
-
-        final updated = await _client
-            .from('drug_lots')
-            .update({
-              'qty_on_hand_base': a.newQtyOnHandBase,
-              'qty_on_hand': a.newQtyOnHandBase, // sync legacy
-            })
-            .eq('id', a.lotId)
-            .eq('owner_id', ownerId)
-            .select('id')
-            .maybeSingle()
-            .timeout(const Duration(seconds: 15));
-
-        if (updated == null) {
-          throw Exception(
-              'อัปเดตสต็อกล็อตไม่สำเร็จ (RLS/เงื่อนไข update ไม่ตรง) lotId=${a.lotId}');
-        }
-      }
+  Future<void> _saveAll() async {
+    if (_cart.isEmpty) {
+      _toast('ยังไม่มีรายการในตะกร้า');
+      return;
     }
-
-    // 3) verify readback
-    final verify = await _client
-        .from('stock_out_receipts')
-        .select('id')
-        .eq('owner_id', ownerId)
-        .eq('id', receiptId)
-        .maybeSingle()
-        .timeout(const Duration(seconds: 15));
-
-    debugPrint('VERIFY receipt readback: $verify');
-
-    if (!mounted) return;
-
-    if (verify == null) {
-      _toast('บันทึกสำเร็จ แต่ระบบอ่านข้อมูลไม่ได้ (RLS SELECT อาจบล็อก) ❗');
-      Navigator.pop(context, true);
+    if (_saving) {
+      _toast('กำลังบันทึกอยู่...');
       return;
     }
 
-    _toast('บันทึกการจ่ายสำเร็จ ✅');
-    Navigator.pop(context, true);
-  } on TimeoutException {
-    debugPrint('=== STOCK_OUT TIMEOUT ===');
-    if (!mounted) return;
-    _toast('บันทึกช้า/ค้างเกินเวลา ลองใหม่อีกครั้ง');
-  } catch (e, st) {
-    debugPrint('=== STOCK_OUT SAVE ERROR ===');
-    debugPrint('Error: $e');
-    debugPrint('Stack: $st');
+    setState(() => _saving = true);
 
-    if (e is PostgrestException) {
-      debugPrint('PostgrestException.code: ${e.code}');
-      debugPrint('PostgrestException.message: ${e.message}');
-      debugPrint('PostgrestException.details: ${e.details}');
-      debugPrint('PostgrestException.hint: ${e.hint}');
+    try {
+      final ownerId = _ownerId();
+      final nowIso = DateTime.now().toIso8601String();
+
+      final receipt = await _client
+          .from('stock_out_receipts')
+          .insert({
+            'owner_id': ownerId,
+            'patient_id': _selectedPatient?.id,
+            'patient_name': _patientCtrl.text.trim().isEmpty
+                ? (_selectedPatient?.fullName)
+                : _patientCtrl.text.trim(),
+            'note': _noteCtrl.text.trim().isEmpty ? null : _noteCtrl.text.trim(),
+            'sold_at': nowIso,
+          })
+          .select('id')
+          .single()
+          .timeout(const Duration(seconds: 15));
+
+      final receiptId = (receipt['id'] ?? '').toString();
+
+      for (final line in _cart) {
+        final allocations = await _allocateLotsFEFO(
+          ownerId: ownerId,
+          drugId: line.drugId,
+          needBase: line.qtyBase,
+        ).timeout(const Duration(seconds: 15));
+
+        final allocatedSum = allocations.fold<num>(0, (p, a) => p + a.qtyBase);
+        if (allocatedSum < line.qtyBase) {
+          throw Exception(
+            'สต็อกไม่พอสำหรับ ${line.drugName} (ต้องการ ${line.qtyBase} ฐาน แต่มี $allocatedSum ฐาน)',
+          );
+        }
+
+        for (final a in allocations) {
+          final lineTotal = a.qtyBase * line.sellPerBase;
+
+          await _client
+              .from('stock_out_items')
+              .insert({
+                'owner_id': ownerId,
+                'receipt_id': receiptId,
+                'drug_id': line.drugId,
+                'lot_no': a.lotNo,
+                'exp_date': a.expDate,
+                'qty_base': a.qtyBase,
+                'sell_per_base': line.sellPerBase,
+                'line_total': lineTotal,
+              })
+              .timeout(const Duration(seconds: 15));
+
+          final updated = await _client
+              .from('drug_lots')
+              .update({
+                'qty_on_hand_base': a.newQtyOnHandBase,
+                'qty_on_hand': a.newQtyOnHandBase,
+              })
+              .eq('id', a.lotId)
+              .eq('owner_id', ownerId)
+              .select('id')
+              .maybeSingle()
+              .timeout(const Duration(seconds: 15));
+
+          if (updated == null) {
+            throw Exception('อัปเดตสต็อกล็อตไม่สำเร็จ (RLS/เงื่อนไข update ไม่ตรง) lotId=${a.lotId}');
+          }
+        }
+      }
+
+      final verify = await _client
+          .from('stock_out_receipts')
+          .select('id')
+          .eq('owner_id', ownerId)
+          .eq('id', receiptId)
+          .maybeSingle()
+          .timeout(const Duration(seconds: 15));
+
+      if (!mounted) return;
+
+      if (verify == null) {
+        _toast('บันทึกสำเร็จ แต่ระบบอ่านข้อมูลไม่ได้ (RLS SELECT อาจบล็อก) ❗');
+        Navigator.pop(context, true);
+        return;
+      }
+
+      _toast('บันทึกการจ่ายสำเร็จ ✅');
+      Navigator.pop(context, true);
+    } on TimeoutException {
+      if (!mounted) return;
+      _toast('บันทึกช้า/ค้างเกินเวลา ลองใหม่อีกครั้ง');
+    } catch (e) {
+      if (!mounted) return;
+      _toast('บันทึกไม่สำเร็จ: $e');
+    } finally {
+      if (mounted) setState(() => _saving = false);
     }
-
-    if (!mounted) return;
-    _toast('บันทึกไม่สำเร็จ: $e');
-  } finally {
-    if (mounted) setState(() => _saving = false);
   }
-}
 
   // ===============================
   // UI
@@ -649,7 +640,27 @@ Future<void> _saveAll() async {
     return Scaffold(
       backgroundColor: const Color(0xFFF4F7FB),
       appBar: AppBar(
-        title: const Text('Phamory • จ่ายยาออก (หลายรายการ)'),
+        title: const Text('จ่ายยาออก'),
+        centerTitle: true,
+        backgroundColor: const Color(0xFF0EA37A),
+        foregroundColor: Colors.white,
+        elevation: 0,
+        surfaceTintColor: Colors.transparent,
+        actions: [
+          IconButton(
+            tooltip: 'ประวัติการทำรายการ',
+            icon: const Icon(Icons.history_rounded),
+            onPressed: () {
+              Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (_) => PatientOrdersHistoryPage(
+                    initialPatient: _selectedPatient,
+                  ),
+                ),
+              );
+            },
+          ),
+        ],
       ),
       body: _loading
           ? const Center(child: CircularProgressIndicator())
@@ -671,7 +682,7 @@ Future<void> _saveAll() async {
                         const SizedBox(height: 12),
                         _buildCartCard(total),
                         const SizedBox(height: 12),
-                        _buildPatientCard(), // ✅ updated
+                        _buildPatientCard(),
                         const SizedBox(height: 16),
                         _buildSaveButton(),
                       ],
@@ -718,6 +729,72 @@ Future<void> _saveAll() async {
           const SizedBox(height: 12),
 
           _buildDrugDropdown(),
+
+          // ✅ กล่อง "หมวดหมู่" ใต้ dropdown
+          if ((_selectedDrug?.category ?? '').trim().isNotEmpty) ...[
+            const SizedBox(height: 10),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Colors.amber.shade50,
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(color: Colors.amber.shade200),
+              ),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Icon(Icons.lightbulb_outline, color: Colors.amber.shade700),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      'หมวดหมู่: ${_selectedDrug!.category!.trim()}',
+                      style: TextStyle(color: Colors.amber.shade900, height: 1.4),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+
+          // ✅ example_text
+          if (_drugExampleText != null) ...[
+            const SizedBox(height: 10),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Colors.amber.shade50,
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(color: Colors.amber.shade200),
+              ),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Icon(Icons.lightbulb_outline, color: Colors.amber.shade700),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      _drugExampleText!,
+                      style: TextStyle(color: Colors.amber.shade900, height: 1.4),
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: 'ใส่ลงหมายเหตุบิล',
+                    onPressed: () {
+                      final t = _drugExampleText!.trim();
+                      if (t.isEmpty) return;
+                      final cur = _noteCtrl.text.trim();
+                      _noteCtrl.text = cur.isEmpty ? t : '$cur\n$t';
+                      _toast('เพิ่มลงหมายเหตุแล้ว');
+                    },
+                    icon: const Icon(Icons.note_add_outlined),
+                  ),
+                ],
+              ),
+            ),
+          ],
+
           const SizedBox(height: 12),
           Row(
             children: [
@@ -744,9 +821,7 @@ Future<void> _saveAll() async {
                         value: _autoPrice,
                         onChanged: (v) async {
                           setState(() => _autoPrice = v);
-                          if (_autoPrice) {
-                            await _recalcSuggestedPrice();
-                          }
+                          if (_autoPrice) await _recalcSuggestedPrice();
                         },
                       ),
                     ],
@@ -792,6 +867,7 @@ Future<void> _saveAll() async {
     );
   }
 
+  // ✅ กัน overflow ตอน dropdown แสดงค่าที่เลือก
   Widget _buildDrugDropdown() {
     final list = _filteredDrugs;
 
@@ -805,28 +881,69 @@ Future<void> _saveAll() async {
       }
     }
 
+    Widget itemTile(_DrugOption d) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            d.code.isEmpty ? d.name : '${d.name} (${d.code})',
+            style: const TextStyle(fontWeight: FontWeight.w800),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          ),
+          if ((d.category ?? '').trim().isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Text(
+                'หมวดหมู่: ${d.category!.trim()}',
+                style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+        ],
+      );
+    }
+
+    final current = (list.isNotEmpty)
+        ? (list.firstWhere(
+            (x) => _selectedDrug != null && x.id == _selectedDrug!.id,
+            orElse: () => list.first,
+          ))
+        : null;
+
     return InputDecorator(
       decoration: InputDecoration(
         labelText: 'เลือกยา',
         border: OutlineInputBorder(borderRadius: BorderRadius.circular(14)),
         filled: true,
         fillColor: Colors.white,
+        contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
       ),
       child: DropdownButtonHideUnderline(
         child: DropdownButton<_DrugOption>(
           isExpanded: true,
-          value: (list.isNotEmpty)
-              ? (list.firstWhere(
-                  (x) => _selectedDrug != null && x.id == _selectedDrug!.id,
-                  orElse: () => list.first,
-                ))
-              : null,
-          items: list
-              .map((d) => DropdownMenuItem(
-                    value: d,
-                    child: Text(d.code.isEmpty ? d.name : '${d.name} (${d.code})'),
-                  ))
-              .toList(),
+          value: current,
+          selectedItemBuilder: (context) {
+            return list.map((d) {
+              return Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  d.code.isEmpty ? d.name : '${d.name} (${d.code})',
+                  style: const TextStyle(fontWeight: FontWeight.w800),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              );
+            }).toList();
+          },
+          items: list.map((d) {
+            return DropdownMenuItem<_DrugOption>(
+              value: d,
+              child: itemTile(d),
+            );
+          }).toList(),
           onChanged: (v) async {
             if (v == null) return;
             await _onSelectDrug(v);
@@ -980,7 +1097,7 @@ Future<void> _saveAll() async {
   }
 
   // ===============================
-  // ✅ UPDATED: Patient Card
+  // ✅ Patient Card
   // ===============================
   Widget _buildPatientCard() {
     return Card(
@@ -998,7 +1115,6 @@ Future<void> _saveAll() async {
               child: LinearProgressIndicator(minHeight: 3),
             ),
 
-          // ✅ Autocomplete picker
           PatientPicker(
             patients: _patients,
             value: _selectedPatient,
@@ -1080,7 +1196,10 @@ Future<void> _saveAll() async {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                    
+                        Text(
+                          _selectedPatient!.fullName,
+                          style: const TextStyle(fontWeight: FontWeight.w900),
+                        ),
                         const SizedBox(height: 4),
                         Text(
                           'อายุ: ${_selectedPatient!.age ?? '-'} • กรุ๊ปเลือด: ${_selectedPatient!.bloodGroup ?? '-'}',
@@ -1179,12 +1298,14 @@ class _DrugOption {
   final String name;
   final String code;
   final String baseUnit;
+  final String? category;
 
   _DrugOption({
     required this.id,
     required this.name,
     required this.code,
     required this.baseUnit,
+    this.category,
   });
 }
 
@@ -1238,8 +1359,8 @@ class _LotPricePreview {
   final String expDate;
   final num qtyBase;
 
-  final num? lotSellPerBase; // ราคาเฉพาะล็อต (ถ้ามี)
-  final num? usedSellPerBase; // ราคาที่ใช้จริง (ล็อต หรือ fallback)
+  final num? lotSellPerBase;
+  final num? usedSellPerBase;
 
   _LotPricePreview({
     required this.lotNo,

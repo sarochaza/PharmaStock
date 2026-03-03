@@ -1,17 +1,18 @@
 // lib/pages/home/home_page.dart
+import 'dart:async';
 import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../../core/supabase_guard.dart';
 import '../auth/auth_gate.dart';
-import '../drugs/add_drug_page.dart';
-import '../stock/stock_in_page.dart';
-import '../stock/stock_out_page.dart';
 import 'about_page.dart';
 import 'expiry_calendar_page.dart';
 import 'profile_page.dart';
 import 'security_page.dart';
+import 'partners/manufacturers_page.dart';
+import 'partners/suppliers_page.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -26,10 +27,15 @@ class _HomePageState extends State<HomePage> {
   bool _loading = true;
   String? _error;
 
-  // ===== Profile header (NEW) =====
+  // ✅ Scroll to sections (keep for future)
+  final ScrollController _scrollCtl = ScrollController();
+  final GlobalKey _manuKey = GlobalKey();
+  final GlobalKey _suppKey = GlobalKey();
+
+  // ===== Profile header =====
   String? _shopName;
   String? _displayName;
-  String? _logoUrl; // profiles.logo_url
+  String? _logoUrl;
 
   // ===== Dashboard numbers =====
   int _drugCount = 0;
@@ -37,9 +43,15 @@ class _HomePageState extends State<HomePage> {
 
   int _expiredCount = 0;
   int _nearExpireCount = 0;
+
+  // ✅ แยกยาสต็อกต่ำ vs ยาไม่มีสต็อก
   int _lowStockCount = 0;
+  int _outStockCount = 0;
 
   num _onHandBaseTotal = 0;
+
+  // ✅ แยกคงเหลือตามหน่วยฐาน
+  Map<String, num> _onHandByBaseUnit = {};
 
   // ===== Financial =====
   int _days = 30;
@@ -51,6 +63,11 @@ class _HomePageState extends State<HomePage> {
   List<_ChartPoint> _salesSeries = [];
   List<_TopDrug> _top5 = [];
 
+  // ✅ Top 10 ขายดี: รายวัน / รายเดือน
+  int _topMode = 0; // 0=daily, 1=monthly
+  List<_TopDrug> _top10Daily = [];
+  List<_TopDrug> _top10Monthly = [];
+
   // ===== Manufacturers & Suppliers =====
   List<Map<String, dynamic>> _manufacturers = [];
   List<Map<String, dynamic>> _suppliers = [];
@@ -60,11 +77,12 @@ class _HomePageState extends State<HomePage> {
   String _mQ = '';
   String _sQ = '';
 
-  // ===== Alert details (NEW) =====
+  // ===== Alert details =====
   bool _loadingAlerts = false;
   List<_DrugAlertGroup> _expiredGroups = [];
   List<_DrugAlertGroup> _nearExpireGroups = [];
   List<_DrugAlertGroup> _lowStockGroups = [];
+  List<_DrugAlertGroup> _outStockGroups = [];
 
   @override
   void initState() {
@@ -92,6 +110,7 @@ class _HomePageState extends State<HomePage> {
   void dispose() {
     _mSearchCtl.dispose();
     _sSearchCtl.dispose();
+    _scrollCtl.dispose();
     super.dispose();
   }
 
@@ -102,7 +121,7 @@ class _HomePageState extends State<HomePage> {
   }
 
   // =========================
-  // ✅ NEW: Load profile header (logo/name) from profiles
+  // Profile header (logo/name)
   // =========================
   Future<void> _loadProfileHeader() async {
     final sb = _sb!;
@@ -145,15 +164,16 @@ class _HomePageState extends State<HomePage> {
 
     try {
       await Future.wait([
-        _loadProfileHeader(), // ✅ NEW
+        _loadProfileHeader(),
         _loadInventoryStats(),
         _loadFinance(days: _days),
         _loadSalesSeries(days: _days),
         _loadTopSellers(days: _days),
+        _loadTop10Daily(),
+        _loadTop10Monthly(),
         _loadManufacturers(),
         _loadSuppliers(),
-
-        _loadAlertDetails(), // ✅ NEW: รายละเอียดแจ้งเตือนกดดูยา/ล็อตได้
+        _loadAlertDetails(),
       ]);
     } catch (e) {
       _error = '$e';
@@ -163,18 +183,21 @@ class _HomePageState extends State<HomePage> {
   }
 
   // =========================
-  // Inventory / Finance (เดิม)
+  // Inventory / Finance
   // =========================
   Future<void> _loadInventoryStats() async {
     final sb = _sb!;
     final ownerId = _ownerId();
+
     final now = DateTime.now();
     final today = DateTime(now.year, now.month, now.day);
     final todayStr = _dateOnly(today);
 
+    // count drugs
     final drugsRows = await sb.from('drugs').select('id').eq('owner_id', ownerId);
     _drugCount = (drugsRows as List).length;
 
+    // lots (only count lots with qty>0)
     final lotsRows = await sb
         .from('drug_lots')
         .select('id, exp_date, qty_on_hand_base')
@@ -206,20 +229,51 @@ class _HomePageState extends State<HomePage> {
     _nearExpireCount = nearExpire;
     _onHandBaseTotal = onHandTotal;
 
+    // ✅ แยก low/out + รวมคงเหลือแยกหน่วยฐาน จาก v_drug_stock_summary + drugs.base_unit
     try {
       final sumRows = await sb
           .from('v_drug_stock_summary')
-          .select('drug_id, stock_status')
+          .select('drug_id, on_hand_base, stock_status')
           .eq('owner_id', ownerId);
 
+      final onHandMap = <String, num>{};
       int low = 0;
+      int out = 0;
+
       for (final r in (sumRows as List)) {
+        final id = (r['drug_id'] ?? '').toString();
+        if (id.isEmpty) continue;
+
+        final onHand = (r['on_hand_base'] as num?) ?? 0;
+        onHandMap[id] = onHand;
+
         final st = (r['stock_status'] ?? '').toString();
-        if (st == 'low' || st == 'out') low++;
+        if (st == 'low') low++;
+        if (st == 'out') out++;
       }
+
+      final drugRows =
+          await sb.from('drugs').select('id, base_unit').eq('owner_id', ownerId);
+
+      final byUnit = <String, num>{};
+      for (final d in (drugRows as List)) {
+        final id = (d['id'] ?? '').toString();
+        if (id.isEmpty) continue;
+
+        final unit = (d['base_unit'] ?? '').toString().trim();
+        if (unit.isEmpty) continue;
+
+        final qty = onHandMap[id] ?? 0;
+        byUnit[unit] = (byUnit[unit] ?? 0) + qty;
+      }
+
       _lowStockCount = low;
+      _outStockCount = out;
+      _onHandByBaseUnit = byUnit;
     } catch (_) {
       _lowStockCount = 0;
+      _outStockCount = 0;
+      _onHandByBaseUnit = {};
     }
   }
 
@@ -389,8 +443,78 @@ class _HomePageState extends State<HomePage> {
     }).toList();
   }
 
+  // ✅ Top 10 รายวัน (วันนี้)
+  Future<void> _loadTop10Daily() async {
+    final now = DateTime.now();
+    final start = DateTime(now.year, now.month, now.day);
+    final startIso = start.toIso8601String();
+
+    _top10Daily = await _loadTopRange(fromIso: startIso, label: 'daily', limit: 10);
+  }
+
+  // ✅ Top 10 รายเดือน (ตั้งแต่วันแรกของเดือน)
+  Future<void> _loadTop10Monthly() async {
+    final now = DateTime.now();
+    final start = DateTime(now.year, now.month, 1);
+    final startIso = start.toIso8601String();
+
+    _top10Monthly = await _loadTopRange(fromIso: startIso, label: 'monthly', limit: 10);
+  }
+
+  Future<List<_TopDrug>> _loadTopRange({
+    required String fromIso,
+    required String label,
+    required int limit,
+  }) async {
+    final sb = _sb!;
+    final ownerId = _ownerId();
+    final map = <String, _TopDrugAgg>{};
+
+    try {
+      final rows = await sb
+          .from('stock_out_items')
+          .select(
+              'drug_id, qty_base, line_total, created_at, drugs(generic_name, brand_name, base_unit)')
+          .eq('owner_id', ownerId)
+          .gte('created_at', fromIso);
+
+      for (final r in (rows as List)) {
+        final drugId = (r['drug_id'] ?? '').toString();
+        if (drugId.isEmpty) continue;
+
+        final qty = (r['qty_base'] as num?) ?? 0;
+        final lt = (r['line_total'] as num?) ?? 0;
+
+        final d = (r['drugs'] as Map?) ?? {};
+        final g = (d['generic_name'] ?? '-').toString();
+        final b = (d['brand_name'] ?? '').toString();
+        final unit = (d['base_unit'] ?? '').toString();
+
+        final name = b.trim().isNotEmpty ? '$g ($b)' : g;
+
+        final agg = map.putIfAbsent(
+          drugId,
+          () => _TopDrugAgg(drugId: drugId, name: name, baseUnit: unit),
+        );
+        agg.qtyBase += qty;
+        agg.sales += lt;
+      }
+    } catch (_) {}
+
+    final list = map.values.toList()..sort((a, b) => b.sales.compareTo(a.sales));
+    return list.take(limit).map((a) {
+      return _TopDrug(
+        drugId: a.drugId,
+        name: a.name,
+        baseUnit: a.baseUnit,
+        qtyBase: a.qtyBase,
+        sales: a.sales,
+      );
+    }).toList();
+  }
+
   // =========================
-  // ✅ NEW: Alert Details (ยาไหน/ล็อตไหน)
+  // Alert Details
   // =========================
   Future<void> _loadAlertDetails() async {
     if (_loadingAlerts) return;
@@ -403,8 +527,7 @@ class _HomePageState extends State<HomePage> {
     final today = DateTime(now.year, now.month, now.day);
 
     try {
-      // ดึงล็อตที่มีของ + join drugs
-      // จำกัด exp_date <= วันนี้ + 365 วัน กัน query หนัก
+      // ---------- (A) Expired/NearExpire + LowStock (มีล็อต > 0) ----------
       final limitEnd = today.add(const Duration(days: 365));
 
       final rows = await sb
@@ -462,7 +585,6 @@ class _HomePageState extends State<HomePage> {
 
         final exp = DateTime(l.expDate.year, l.expDate.month, l.expDate.day);
 
-        // expired
         if (exp.isBefore(today)) {
           expiredMap.putIfAbsent(
             l.drugId,
@@ -472,7 +594,6 @@ class _HomePageState extends State<HomePage> {
           continue;
         }
 
-        // nearExpire: ใช้ expiry_alert_days ต่อยา
         final warnDays = math.max(0, l.expiryAlertDays);
         final warnEnd = today.add(Duration(days: warnDays));
         if (!exp.isAfter(warnEnd)) {
@@ -484,7 +605,6 @@ class _HomePageState extends State<HomePage> {
         }
       }
 
-      // low stock: total <= reorder_point (reorder_point > 0)
       final lowGroups = <_DrugAlertGroup>[];
       for (final entry in sumBase.entries) {
         final drugId = entry.key;
@@ -493,7 +613,8 @@ class _HomePageState extends State<HomePage> {
         if (info == null) continue;
 
         final rp = info.reorderPoint;
-        if (rp > 0 && total <= rp) {
+        // ✅ low เฉพาะตัวที่ยังมีสต็อก (>0) และ <= reorder_point
+        if (rp > 0 && total > 0 && total <= rp) {
           final drugLots = lots.where((x) => x.drugId == drugId).toList()
             ..sort((a, b) => a.expDate.compareTo(b.expDate));
           lowGroups.add(_DrugAlertGroup(info: info, lots: drugLots, totalBase: total));
@@ -509,11 +630,59 @@ class _HomePageState extends State<HomePage> {
       _expiredGroups = expiredGroups;
       _nearExpireGroups = nearGroups;
       _lowStockGroups = lowGroups;
+
+      // ---------- (B) Out of stock (ยอดรวม = 0) จาก v_drug_stock_summary ----------
+      try {
+        final sum = await sb
+            .from('v_drug_stock_summary')
+            .select('drug_id, on_hand_base, stock_status, drugs(code, generic_name, brand_name, base_unit, reorder_point, expiry_alert_days)')
+            .eq('owner_id', ownerId);
+
+        final outGroups = <_DrugAlertGroup>[];
+        for (final r in (sum as List)) {
+          final st = (r['stock_status'] ?? '').toString();
+          if (st != 'out') continue;
+
+          final drugId = (r['drug_id'] ?? '').toString();
+          if (drugId.isEmpty) continue;
+
+          final d = (r['drugs'] as Map?) ?? {};
+          final code = (d['code'] ?? '').toString();
+          final g = (d['generic_name'] ?? '-').toString();
+          final b = (d['brand_name'] ?? '').toString();
+          final baseUnit = (d['base_unit'] ?? '').toString();
+          final rp = (d['reorder_point'] as num?) ?? 0;
+          final ead = (d['expiry_alert_days'] as num?)?.toInt() ?? 90;
+
+          final name = b.trim().isNotEmpty ? '$g ($b)' : g;
+
+          outGroups.add(
+            _DrugAlertGroup(
+              info: _DrugInfo(
+                drugId: drugId,
+                code: code,
+                name: name,
+                baseUnit: baseUnit,
+                reorderPoint: rp,
+                expiryAlertDays: ead,
+              ),
+              lots: const [],
+              totalBase: 0,
+            ),
+          );
+        }
+
+        outGroups.sort((a, b) => a.info.name.compareTo(b.info.name));
+        _outStockGroups = outGroups;
+      } catch (_) {
+        _outStockGroups = [];
+      }
     } catch (e) {
       debugPrint('loadAlertDetails error: $e');
       _expiredGroups = [];
       _nearExpireGroups = [];
       _lowStockGroups = [];
+      _outStockGroups = [];
     } finally {
       _loadingAlerts = false;
     }
@@ -540,9 +709,15 @@ class _HomePageState extends State<HomePage> {
         break;
       case _AlertType.lowStock:
         groups = _lowStockGroups;
-        title = 'ยาสต็อกต่ำ/หมด';
+        title = 'ยาสต็อกต่ำ';
         icon = Icons.inventory_2_rounded;
         tone = Colors.deepOrange;
+        break;
+      case _AlertType.outStock:
+        groups = _outStockGroups;
+        title = 'ยาไม่มีสต็อก';
+        icon = Icons.remove_shopping_cart_rounded;
+        tone = Colors.redAccent;
         break;
     }
 
@@ -581,7 +756,6 @@ class _HomePageState extends State<HomePage> {
         }
 
         String qty(num v) {
-          // โชว์แบบสวย ๆ
           if (v % 1 == 0) return v.toStringAsFixed(0);
           return v.toStringAsFixed(2);
         }
@@ -597,7 +771,6 @@ class _HomePageState extends State<HomePage> {
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                // header
                 Container(
                   padding: const EdgeInsets.all(14),
                   decoration: BoxDecoration(
@@ -621,16 +794,24 @@ class _HomePageState extends State<HomePage> {
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            Text(title, style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 16)),
+                            Text(title,
+                                style: const TextStyle(
+                                    fontWeight: FontWeight.w900, fontSize: 16)),
                             const SizedBox(height: 4),
                             Text(
-                              '${groups.length} ยา',
-                              style: TextStyle(color: Colors.black.withOpacity(0.6), fontWeight: FontWeight.w700),
+                              '${groups.length} รายการ',
+                              style: TextStyle(
+                                  color: Colors.black.withOpacity(0.6),
+                                  fontWeight: FontWeight.w700),
                             ),
                           ],
                         ),
                       ),
-                      headerChip(type == _AlertType.lowStock ? 'REORDER' : 'EXP'),
+                      headerChip(
+                        (type == _AlertType.lowStock || type == _AlertType.outStock)
+                            ? 'STOCK'
+                            : 'EXP',
+                      ),
                       const SizedBox(width: 8),
                       IconButton(
                         tooltip: 'ไปหน้าปฏิทินหมดอายุ',
@@ -646,9 +827,7 @@ class _HomePageState extends State<HomePage> {
                     ],
                   ),
                 ),
-
                 const SizedBox(height: 12),
-
                 Flexible(
                   child: groups.isEmpty
                       ? Center(
@@ -656,7 +835,9 @@ class _HomePageState extends State<HomePage> {
                             padding: const EdgeInsets.symmetric(vertical: 28),
                             child: Text(
                               'ยังไม่มีรายการในหมวดนี้',
-                              style: TextStyle(color: Colors.black.withOpacity(0.55), fontWeight: FontWeight.w700),
+                              style: TextStyle(
+                                  color: Colors.black.withOpacity(0.55),
+                                  fontWeight: FontWeight.w700),
                             ),
                           ),
                         )
@@ -670,19 +851,19 @@ class _HomePageState extends State<HomePage> {
                             final rp = g.info.reorderPoint;
                             final total = g.totalBase;
 
-                            // lots in this group
-                            final lots = g.lots..sort((a, b) => a.expDate.compareTo(b.expDate));
+                            final lots = [...g.lots]..sort((a, b) => a.expDate.compareTo(b.expDate));
 
                             return Container(
                               decoration: BoxDecoration(
                                 color: Colors.white,
                                 borderRadius: BorderRadius.circular(18),
                                 border: Border.all(color: Colors.black.withOpacity(0.06)),
+                                // ✅ เงาแบบคม (ไม่ฟุ้ง)
                                 boxShadow: [
                                   BoxShadow(
                                     color: Colors.black.withOpacity(0.03),
-                                    blurRadius: 12,
-                                    offset: const Offset(0, 8),
+                                    blurRadius: 10,
+                                    offset: const Offset(0, 6),
                                   ),
                                 ],
                               ),
@@ -691,7 +872,6 @@ class _HomePageState extends State<HomePage> {
                                 child: Column(
                                   crossAxisAlignment: CrossAxisAlignment.start,
                                   children: [
-                                    // drug header
                                     Row(
                                       children: [
                                         Expanded(
@@ -719,19 +899,22 @@ class _HomePageState extends State<HomePage> {
                                             ],
                                           ),
                                         ),
-                                        if (type == _AlertType.lowStock && total != null)
+                                        if ((type == _AlertType.lowStock || type == _AlertType.outStock) &&
+                                            total != null)
                                           Container(
                                             padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
                                             decoration: BoxDecoration(
-                                              color: Colors.deepOrange.withOpacity(0.10),
+                                              color: tone.withOpacity(0.10),
                                               borderRadius: BorderRadius.circular(999),
-                                              border: Border.all(color: Colors.deepOrange.withOpacity(0.22)),
+                                              border: Border.all(color: tone.withOpacity(0.22)),
                                             ),
                                             child: Text(
-                                              'คงเหลือ ${qty(total)}',
+                                              type == _AlertType.outStock
+                                                  ? 'คงเหลือ 0'
+                                                  : 'คงเหลือ ${qty(total)}',
                                               style: TextStyle(
                                                 fontWeight: FontWeight.w900,
-                                                color: Colors.deepOrange.shade700,
+                                                color: tone,
                                                 fontSize: 12,
                                               ),
                                             ),
@@ -739,82 +922,118 @@ class _HomePageState extends State<HomePage> {
                                       ],
                                     ),
 
-                                    if (type == _AlertType.lowStock && rp > 0) ...[
+                                    if ((type == _AlertType.lowStock || type == _AlertType.outStock) && rp > 0) ...[
                                       const SizedBox(height: 8),
                                       Text(
                                         'จุดสั่งซื้อ (reorder_point): ${qty(rp)} ${g.info.baseUnit}',
-                                        style: TextStyle(color: Colors.black.withOpacity(0.55), fontWeight: FontWeight.w700),
+                                        style: TextStyle(
+                                            color: Colors.black.withOpacity(0.55),
+                                            fontWeight: FontWeight.w700),
                                       ),
                                     ],
 
-                                    const SizedBox(height: 10),
-
-                                    // lots list
-                                    Container(
-                                      padding: const EdgeInsets.all(10),
-                                      decoration: BoxDecoration(
-                                        color: const Color(0xFFF4F7FB),
-                                        borderRadius: BorderRadius.circular(14),
-                                        border: Border.all(color: Colors.black.withOpacity(0.06)),
-                                      ),
-                                      child: Column(
-                                        children: List.generate(lots.length, (j) {
-                                          final l = lots[j];
-                                          final dLeft = daysTo(l.expDate);
-                                          final badgeText = type == _AlertType.lowStock
-                                              ? 'ล็อต ${l.lotNo}'
-                                              : (dLeft < 0 ? 'หมดอายุ' : 'อีก $dLeft วัน');
-
-                                          final badgeColor = type == _AlertType.expired
-                                              ? Colors.red
-                                              : (type == _AlertType.nearExpire ? Colors.orange : cs.primary);
-
-                                          return Padding(
-                                            padding: EdgeInsets.only(bottom: j == lots.length - 1 ? 0 : 8),
-                                            child: Row(
-                                              children: [
-                                                Expanded(
-                                                  child: Text(
-                                                    'ล็อต: ${l.lotNo} • หมดอายุ: ${fmtDate(l.expDate)}',
-                                                    style: const TextStyle(fontWeight: FontWeight.w800, height: 1.2),
-                                                  ),
+                                    if (type == _AlertType.outStock) ...[
+                                      const SizedBox(height: 10),
+                                      Container(
+                                        padding: const EdgeInsets.all(10),
+                                        decoration: BoxDecoration(
+                                          color: const Color(0xFFF4F7FB),
+                                          borderRadius: BorderRadius.circular(14),
+                                          border: Border.all(color: Colors.black.withOpacity(0.06)),
+                                        ),
+                                        child: Row(
+                                          children: [
+                                            Icon(Icons.info_outline_rounded,
+                                                color: Colors.black.withOpacity(0.55)),
+                                            const SizedBox(width: 8),
+                                            Expanded(
+                                              child: Text(
+                                                'ไม่พบสต็อกคงเหลือ (ยอดรวมเป็น 0)',
+                                                style: TextStyle(
+                                                  fontWeight: FontWeight.w800,
+                                                  color: Colors.black.withOpacity(0.65),
                                                 ),
-                                                const SizedBox(width: 8),
-                                                Container(
-                                                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                                                  decoration: BoxDecoration(
-                                                    color: badgeColor.withOpacity(0.10),
-                                                    borderRadius: BorderRadius.circular(999),
-                                                    border: Border.all(color: badgeColor.withOpacity(0.22)),
-                                                  ),
-                                                  child: Text(
-                                                    badgeText,
-                                                    style: TextStyle(
-                                                      fontWeight: FontWeight.w900,
-                                                      color: badgeColor,
-                                                      fontSize: 12,
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                    ],
+
+                                    if (type != _AlertType.outStock) ...[
+                                      const SizedBox(height: 10),
+                                      Container(
+                                        padding: const EdgeInsets.all(10),
+                                        decoration: BoxDecoration(
+                                          color: const Color(0xFFF4F7FB),
+                                          borderRadius: BorderRadius.circular(14),
+                                          border: Border.all(color: Colors.black.withOpacity(0.06)),
+                                        ),
+                                        child: Column(
+                                          children: List.generate(lots.length, (j) {
+                                            final l = lots[j];
+                                            final dLeft = daysTo(l.expDate);
+                                            final badgeText = (type == _AlertType.lowStock)
+                                                ? 'ล็อต ${l.lotNo}'
+                                                : (dLeft < 0 ? 'หมดอายุ' : 'อีก $dLeft วัน');
+
+                                            final badgeColor = type == _AlertType.expired
+                                                ? Colors.red
+                                                : (type == _AlertType.nearExpire
+                                                    ? Colors.orange
+                                                    : cs.primary);
+
+                                            return Padding(
+                                              padding: EdgeInsets.only(bottom: j == lots.length - 1 ? 0 : 8),
+                                              child: Row(
+                                                children: [
+                                                  Expanded(
+                                                    child: Text(
+                                                      'ล็อต: ${l.lotNo} • หมดอายุ: ${fmtDate(l.expDate)}',
+                                                      style: const TextStyle(
+                                                          fontWeight: FontWeight.w800, height: 1.2),
                                                     ),
                                                   ),
-                                                ),
-                                                const SizedBox(width: 8),
-                                                Container(
-                                                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                                                  decoration: BoxDecoration(
-                                                    color: cs.primary.withOpacity(0.08),
-                                                    borderRadius: BorderRadius.circular(999),
-                                                    border: Border.all(color: cs.primary.withOpacity(0.18)),
+                                                  const SizedBox(width: 8),
+                                                  Container(
+                                                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                                                    decoration: BoxDecoration(
+                                                      color: badgeColor.withOpacity(0.10),
+                                                      borderRadius: BorderRadius.circular(999),
+                                                      border: Border.all(color: badgeColor.withOpacity(0.22)),
+                                                    ),
+                                                    child: Text(
+                                                      badgeText,
+                                                      style: TextStyle(
+                                                        fontWeight: FontWeight.w900,
+                                                        color: badgeColor,
+                                                        fontSize: 12,
+                                                      ),
+                                                    ),
                                                   ),
-                                                  child: Text(
-                                                    '${qty(l.qtyBase)} ${g.info.baseUnit}',
-                                                    style: TextStyle(fontWeight: FontWeight.w900, color: cs.primary, fontSize: 12),
+                                                  const SizedBox(width: 8),
+                                                  Container(
+                                                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                                                    decoration: BoxDecoration(
+                                                      color: cs.primary.withOpacity(0.08),
+                                                      borderRadius: BorderRadius.circular(999),
+                                                      border: Border.all(color: cs.primary.withOpacity(0.18)),
+                                                    ),
+                                                    child: Text(
+                                                      '${qty(l.qtyBase)} ${g.info.baseUnit}',
+                                                      style: TextStyle(
+                                                          fontWeight: FontWeight.w900,
+                                                          color: cs.primary,
+                                                          fontSize: 12),
+                                                    ),
                                                   ),
-                                                ),
-                                              ],
-                                            ),
-                                          );
-                                        }),
+                                                ],
+                                              ),
+                                            );
+                                          }),
+                                        ),
                                       ),
-                                    ),
+                                    ],
                                   ],
                                 ),
                               ),
@@ -822,9 +1041,7 @@ class _HomePageState extends State<HomePage> {
                           },
                         ),
                 ),
-
                 const SizedBox(height: 12),
-
                 SizedBox(
                   width: double.infinity,
                   child: FilledButton.icon(
@@ -842,7 +1059,7 @@ class _HomePageState extends State<HomePage> {
   }
 
   // =========================
-  // Manufacturers & Suppliers (CRUD)
+  // Manufacturers & Suppliers (load)
   // =========================
   Future<void> _loadManufacturers() async {
     final sb = _sb!;
@@ -879,455 +1096,6 @@ class _HomePageState extends State<HomePage> {
         (rows as List).map((e) => Map<String, dynamic>.from(e as Map)).toList();
   }
 
-  List<Map<String, dynamic>> get _filteredManufacturers {
-    final q = _mQ;
-    if (q.isEmpty) return _manufacturers;
-    return _manufacturers.where((m) {
-      final name = (m['name'] ?? '').toString().toLowerCase();
-      final country = (m['country'] ?? '').toString().toLowerCase();
-      final phone = (m['phone'] ?? '').toString().toLowerCase();
-      final fda = (m['fda_number'] ?? '').toString().toLowerCase();
-      final code = (m['code'] ?? '').toString().toLowerCase();
-      return name.contains(q) ||
-          country.contains(q) ||
-          phone.contains(q) ||
-          fda.contains(q) ||
-          code.contains(q);
-    }).toList();
-  }
-
-  List<Map<String, dynamic>> get _filteredSuppliers {
-    final q = _sQ;
-    if (q.isEmpty) return _suppliers;
-
-    return _suppliers.where((s) {
-      String v(String k) => (s[k] ?? '').toString().toLowerCase();
-
-      return v('name').contains(q) ||
-          v('company_name').contains(q) ||
-          v('contact_name').contains(q) ||
-          v('phone').contains(q) ||
-          v('address').contains(q) ||
-          v('delivery_area').contains(q) ||
-          v('code').contains(q) ||
-          v('line_id').contains(q) ||
-          v('email').contains(q) ||
-          v('company_reg_no').contains(q) ||
-          v('drug_license_no').contains(q) ||
-          v('note').contains(q);
-    }).toList();
-  }
-
-  void _toast(String msg) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
-  }
-
-  InputDecoration _dec(String label, {String? hint, IconData? icon}) {
-    return InputDecoration(
-      labelText: label,
-      hintText: hint,
-      prefixIcon: icon == null ? null : Icon(icon),
-      border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-      filled: true,
-      fillColor: Colors.white,
-    );
-  }
-
-  // ---------- Manufacturer editor (เดิม) ----------
-  Future<void> _showManufacturerEditor({Map<String, dynamic>? edit}) async {
-    final sb = _sb!;
-    final ownerId = _ownerId();
-    final isEdit = edit != null;
-
-    final formKey = GlobalKey<FormState>();
-    final nameCtl = TextEditingController(text: (edit?['name'] ?? '').toString());
-    final codeCtl = TextEditingController(text: (edit?['code'] ?? '').toString());
-    final countryCtl =
-        TextEditingController(text: (edit?['country'] ?? 'ประเทศไทย').toString());
-    final addressCtl =
-        TextEditingController(text: (edit?['address'] ?? '').toString());
-    final phoneCtl = TextEditingController(text: (edit?['phone'] ?? '').toString());
-    final fdaCtl =
-        TextEditingController(text: (edit?['fda_number'] ?? '').toString());
-
-    bool saving = false;
-
-    await showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (ctx) {
-        final cs = Theme.of(ctx).colorScheme;
-        return StatefulBuilder(
-          builder: (ctx, setD) {
-            return AlertDialog(
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-              title: Row(
-                children: [
-                  Icon(Icons.domain_rounded, color: cs.primary),
-                  const SizedBox(width: 8),
-                  Text(isEdit ? 'แก้ไขผู้ผลิต' : 'เพิ่มผู้ผลิตใหม่',
-                      style: const TextStyle(fontWeight: FontWeight.w900)),
-                ],
-              ),
-              content: SingleChildScrollView(
-                child: Form(
-                  key: formKey,
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      TextFormField(
-                        controller: nameCtl,
-                        decoration: _dec('ชื่อบริษัทผู้ผลิต *', icon: Icons.business_rounded),
-                        validator: (v) =>
-                            (v ?? '').trim().isEmpty ? 'กรุณากรอกชื่อบริษัท' : null,
-                      ),
-                      const SizedBox(height: 12),
-                      TextFormField(
-                        controller: codeCtl,
-                        decoration: _dec('รหัสบริษัท (ถ้ามี)', icon: Icons.qr_code_rounded),
-                      ),
-                      const SizedBox(height: 12),
-                      TextFormField(
-                        controller: countryCtl,
-                        decoration: _dec('ประเทศ', icon: Icons.public_rounded),
-                      ),
-                      const SizedBox(height: 12),
-                      TextFormField(
-                        controller: addressCtl,
-                        maxLines: 2,
-                        decoration: _dec('ที่อยู่บริษัท', icon: Icons.location_on_rounded),
-                      ),
-                      const SizedBox(height: 12),
-                      TextFormField(
-                        controller: phoneCtl,
-                        decoration: _dec('เบอร์ติดต่อ', icon: Icons.phone_rounded),
-                        keyboardType: TextInputType.phone,
-                      ),
-                      const SizedBox(height: 12),
-                      TextFormField(
-                        controller: fdaCtl,
-                        decoration: _dec('เลขทะเบียน อย.', icon: Icons.verified_rounded),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-              actions: [
-                TextButton(
-                  onPressed: saving ? null : () => Navigator.pop(ctx),
-                  child: const Text('ยกเลิก', style: TextStyle(color: Colors.grey)),
-                ),
-                FilledButton(
-                  onPressed: saving
-                      ? null
-                      : () async {
-                          if (!(formKey.currentState?.validate() ?? false)) return;
-                          setD(() => saving = true);
-                          try {
-                            final payload = <String, dynamic>{
-                              'owner_id': ownerId,
-                              'name': nameCtl.text.trim(),
-                              'code': codeCtl.text.trim().isEmpty ? null : codeCtl.text.trim(),
-                              'country': countryCtl.text.trim().isEmpty ? null : countryCtl.text.trim(),
-                              'address': addressCtl.text.trim().isEmpty ? null : addressCtl.text.trim(),
-                              'phone': phoneCtl.text.trim().isEmpty ? null : phoneCtl.text.trim(),
-                              'fda_number': fdaCtl.text.trim().isEmpty ? null : fdaCtl.text.trim(),
-                            };
-
-                            if (isEdit) {
-                              await sb.from('manufacturers').update(payload).eq('id', edit!['id']);
-                            } else {
-                              await sb.from('manufacturers').insert(payload);
-                            }
-
-                            await _loadManufacturers();
-                            if (mounted) setState(() {});
-                            if (ctx.mounted) Navigator.pop(ctx);
-                            _toast(isEdit ? 'บันทึกการแก้ไขผู้ผลิตแล้ว ✅' : 'เพิ่มผู้ผลิตแล้ว ✅');
-                          } catch (e) {
-                            _toast('บันทึกไม่สำเร็จ: $e');
-                          } finally {
-                            if (ctx.mounted) setD(() => saving = false);
-                          }
-                        },
-                  child: saving
-                      ? const SizedBox(
-                          width: 18,
-                          height: 18,
-                          child: CircularProgressIndicator(
-                              strokeWidth: 2, color: Colors.white),
-                        )
-                      : const Text('บันทึก'),
-                )
-              ],
-            );
-          },
-        );
-      },
-    );
-  }
-
-  // =========================
-  // Supplier editor (เดิมของคุณ)
-  // =========================
-  Future<void> _showSupplierEditor({Map<String, dynamic>? edit}) async {
-    final sb = _sb!;
-    final ownerId = _ownerId();
-    final isEdit = edit != null;
-
-    final formKey = GlobalKey<FormState>();
-
-    final nameCtl = TextEditingController(text: (edit?['name'] ?? '').toString());
-    final codeCtl = TextEditingController(text: (edit?['code'] ?? '').toString());
-
-    final companyCtl =
-        TextEditingController(text: (edit?['company_name'] ?? '').toString());
-    final contactCtl =
-        TextEditingController(text: (edit?['contact_name'] ?? '').toString());
-
-    final phoneCtl = TextEditingController(text: (edit?['phone'] ?? '').toString());
-    final lineCtl = TextEditingController(text: (edit?['line_id'] ?? '').toString());
-    final emailCtl = TextEditingController(text: (edit?['email'] ?? '').toString());
-
-    final addressCtl =
-        TextEditingController(text: (edit?['address'] ?? '').toString());
-    final deliveryCtl =
-        TextEditingController(text: (edit?['delivery_area'] ?? '').toString());
-
-    final regCtl =
-        TextEditingController(text: (edit?['company_reg_no'] ?? '').toString());
-    final licenseCtl =
-        TextEditingController(text: (edit?['drug_license_no'] ?? '').toString());
-
-    final noteCtl = TextEditingController(text: (edit?['note'] ?? '').toString());
-    bool isDefault = (edit?['is_default'] == true);
-    bool isActive = (edit?['is_active'] == null) ? true : (edit?['is_active'] == true);
-
-    bool saving = false;
-
-    Widget section(String title, IconData icon, List<Widget> children) {
-      return Container(
-        width: double.infinity,
-        margin: const EdgeInsets.only(bottom: 12),
-        padding: const EdgeInsets.all(12),
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(14),
-          border: Border.all(color: Colors.black.withOpacity(0.08)),
-          color: Colors.white,
-        ),
-        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Row(
-            children: [
-              Icon(icon, size: 18),
-              const SizedBox(width: 8),
-              Text(title, style: const TextStyle(fontWeight: FontWeight.w900)),
-            ],
-          ),
-          const SizedBox(height: 10),
-          ...children,
-        ]),
-      );
-    }
-
-    await showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (ctx) {
-        final cs = Theme.of(ctx).colorScheme;
-        return StatefulBuilder(
-          builder: (ctx, setD) {
-            return AlertDialog(
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-              title: Row(
-                children: [
-                  Icon(Icons.store_rounded, color: cs.primary),
-                  const SizedBox(width: 8),
-                  Text(isEdit ? 'แก้ไข Supplier' : 'เพิ่ม Supplier ใหม่',
-                      style: const TextStyle(fontWeight: FontWeight.w900)),
-                ],
-              ),
-              content: SizedBox(
-                width: 640,
-                child: SingleChildScrollView(
-                  child: Form(
-                    key: formKey,
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        section('ข้อมูลหลัก', Icons.badge_rounded, [
-                          TextFormField(
-                            controller: nameCtl,
-                            decoration: _dec('ชื่อ Supplier *', icon: Icons.storefront_rounded),
-                            validator: (v) => (v ?? '').trim().isEmpty ? 'กรุณากรอกชื่อ Supplier' : null,
-                          ),
-                          const SizedBox(height: 12),
-                          TextFormField(
-                            controller: codeCtl,
-                            decoration: _dec('รหัส Supplier (ถ้ามี)', icon: Icons.qr_code_rounded),
-                          ),
-                        ]),
-                        section('บริษัท & ผู้ติดต่อ', Icons.business_center_rounded, [
-                          TextFormField(
-                            controller: companyCtl,
-                            decoration: _dec('ชื่อบริษัท', icon: Icons.apartment_rounded),
-                          ),
-                          const SizedBox(height: 12),
-                          TextFormField(
-                            controller: contactCtl,
-                            decoration: _dec('ชื่อผู้ติดต่อ', icon: Icons.person_rounded),
-                          ),
-                        ]),
-                        section('ช่องทางติดต่อ', Icons.contact_phone_rounded, [
-                          TextFormField(
-                            controller: phoneCtl,
-                            decoration: _dec('เบอร์โทร', icon: Icons.phone_rounded),
-                            keyboardType: TextInputType.phone,
-                          ),
-                          const SizedBox(height: 12),
-                          TextFormField(
-                            controller: lineCtl,
-                            decoration: _dec('Line ID', icon: Icons.chat_rounded),
-                          ),
-                          const SizedBox(height: 12),
-                          TextFormField(
-                            controller: emailCtl,
-                            decoration: _dec('Email', icon: Icons.email_rounded),
-                            keyboardType: TextInputType.emailAddress,
-                            validator: (v) {
-                              final t = (v ?? '').trim();
-                              if (t.isEmpty) return null;
-                              if (!t.contains('@') || !t.contains('.')) return 'รูปแบบอีเมลไม่ถูกต้อง';
-                              return null;
-                            },
-                          ),
-                        ]),
-                        section('ที่อยู่ & พื้นที่จัดส่ง', Icons.local_shipping_rounded, [
-                          TextFormField(
-                            controller: addressCtl,
-                            maxLines: 2,
-                            decoration: _dec('ที่อยู่', icon: Icons.location_on_rounded),
-                          ),
-                          const SizedBox(height: 12),
-                          TextFormField(
-                            controller: deliveryCtl,
-                            decoration: _dec('พื้นที่จัดส่ง', icon: Icons.map_rounded),
-                          ),
-                        ]),
-                        section('เอกสาร/เลขทะเบียน', Icons.verified_rounded, [
-                          TextFormField(
-                            controller: regCtl,
-                            decoration: _dec('เลขทะเบียนบริษัท', icon: Icons.fact_check_rounded),
-                          ),
-                          const SizedBox(height: 12),
-                          TextFormField(
-                            controller: licenseCtl,
-                            decoration: _dec('ใบอนุญาตจำหน่ายยา', icon: Icons.health_and_safety_rounded),
-                          ),
-                        ]),
-                        section('การตั้งค่า', Icons.tune_rounded, [
-                          TextFormField(
-                            controller: noteCtl,
-                            maxLines: 2,
-                            decoration: _dec('หมายเหตุ', icon: Icons.notes_rounded),
-                          ),
-                          const SizedBox(height: 12),
-                          SwitchListTile(
-                            contentPadding: EdgeInsets.zero,
-                            value: isActive,
-                            onChanged: (v) => setD(() => isActive = v),
-                            title: const Text('เปิดใช้งาน', style: TextStyle(fontWeight: FontWeight.w800)),
-                            subtitle: Text(
-                              isActive ? 'Supplier นี้จะแสดงใน StockIn' : 'Supplier นี้จะถูกซ่อนจากการเลือก',
-                              style: TextStyle(color: Colors.black.withOpacity(0.55)),
-                            ),
-                          ),
-                          SwitchListTile(
-                            contentPadding: EdgeInsets.zero,
-                            value: isDefault,
-                            onChanged: (v) => setD(() => isDefault = v),
-                            title: const Text('ตั้งเป็นค่าเริ่มต้น', style: TextStyle(fontWeight: FontWeight.w800)),
-                            subtitle: Text(
-                              'เวลาเปิดหน้ารับยาเข้า ระบบจะดึง Supplier แนะนำ',
-                              style: TextStyle(color: Colors.black.withOpacity(0.55)),
-                            ),
-                          ),
-                        ]),
-                      ],
-                    ),
-                  ),
-                ),
-              ),
-              actions: [
-                TextButton(
-                  onPressed: saving ? null : () => Navigator.pop(ctx),
-                  child: const Text('ยกเลิก', style: TextStyle(color: Colors.grey)),
-                ),
-                FilledButton(
-                  onPressed: saving
-                      ? null
-                      : () async {
-                          if (!(formKey.currentState?.validate() ?? false)) return;
-
-                          setD(() => saving = true);
-                          try {
-                            if (isDefault) {
-                              await sb
-                                  .from('suppliers')
-                                  .update({'is_default': false})
-                                  .eq('owner_id', ownerId);
-                            }
-
-                            final payload = <String, dynamic>{
-                              'owner_id': ownerId,
-                              'name': nameCtl.text.trim(),
-                              'code': codeCtl.text.trim().isEmpty ? null : codeCtl.text.trim(),
-                              'company_name': companyCtl.text.trim().isEmpty ? null : companyCtl.text.trim(),
-                              'contact_name': contactCtl.text.trim().isEmpty ? null : contactCtl.text.trim(),
-                              'phone': phoneCtl.text.trim().isEmpty ? null : phoneCtl.text.trim(),
-                              'line_id': lineCtl.text.trim().isEmpty ? null : lineCtl.text.trim(),
-                              'email': emailCtl.text.trim().isEmpty ? null : emailCtl.text.trim(),
-                              'address': addressCtl.text.trim().isEmpty ? null : addressCtl.text.trim(),
-                              'delivery_area': deliveryCtl.text.trim().isEmpty ? null : deliveryCtl.text.trim(),
-                              'company_reg_no': regCtl.text.trim().isEmpty ? null : regCtl.text.trim(),
-                              'drug_license_no': licenseCtl.text.trim().isEmpty ? null : licenseCtl.text.trim(),
-                              'note': noteCtl.text.trim().isEmpty ? null : noteCtl.text.trim(),
-                              'is_default': isDefault,
-                              'is_active': isActive,
-                            };
-
-                            if (isEdit) {
-                              await sb.from('suppliers').update(payload).eq('id', edit!['id']);
-                            } else {
-                              await sb.from('suppliers').insert(payload);
-                            }
-
-                            await _loadSuppliers();
-                            if (mounted) setState(() {});
-                            if (ctx.mounted) Navigator.pop(ctx);
-                            _toast(isEdit ? 'บันทึกการแก้ไข Supplier แล้ว ✅' : 'เพิ่ม Supplier แล้ว ✅');
-                          } catch (e) {
-                            _toast('บันทึกไม่สำเร็จ: $e');
-                          } finally {
-                            if (ctx.mounted) setD(() => saving = false);
-                          }
-                        },
-                  child: saving
-                      ? const SizedBox(
-                          width: 18,
-                          height: 18,
-                          child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
-                        )
-                      : const Text('บันทึก'),
-                )
-              ],
-            );
-          },
-        );
-      },
-    );
-  }
-
   // =========================
   // Helpers
   // =========================
@@ -1355,10 +1123,46 @@ class _HomePageState extends State<HomePage> {
 
   String _money(num v) => v.toStringAsFixed(2);
   int _pct(int part, int total) => ((part * 100) / total).round();
-  String _safeLine(String? s) => (s ?? '').trim().isEmpty ? '-' : s!.trim();
+  String _fmtQty(num v) => (v % 1 == 0) ? v.toStringAsFixed(0) : v.toStringAsFixed(2);
+
+  Widget _onHandByUnitChips(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+
+    if (_onHandByBaseUnit.isEmpty) {
+      return Text('คงเหลือแยกหน่วย: -', style: TextStyle(color: Colors.black.withOpacity(0.55)));
+    }
+
+    final entries = _onHandByBaseUnit.entries.toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
+
+    final chips = <Widget>[];
+    for (final e in entries) {
+      if (e.value <= 0) continue;
+      chips.add(
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          decoration: BoxDecoration(
+            color: cs.primary.withOpacity(0.08),
+            borderRadius: BorderRadius.circular(999),
+            border: Border.all(color: cs.primary.withOpacity(0.18)),
+          ),
+          child: Text(
+            '${e.key}: ${_fmtQty(e.value)}',
+            style: TextStyle(fontWeight: FontWeight.w900, color: cs.primary),
+          ),
+        ),
+      );
+    }
+
+    if (chips.isEmpty) {
+      return Text('คงเหลือแยกหน่วย: -', style: TextStyle(color: Colors.black.withOpacity(0.55)));
+    }
+
+    return Wrap(spacing: 8, runSpacing: 8, children: chips);
+  }
 
   // =========================
-  // ✅ Drawer (Hamburger)
+  // ✅ Drawer (Hamburger) — เหลือแค่โปรไฟล์ & ระบบ + ออกจากระบบล่างสุด (มี confirm)
   // =========================
   Widget _drawerSectionTitle(String text) {
     return Padding(
@@ -1374,6 +1178,29 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _logout() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) {
+        return AlertDialog(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          title: const Text('ออกจากระบบ', style: TextStyle(fontWeight: FontWeight.w900)),
+          content: const Text('ต้องการออกจากระบบใช่ไหม?'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('ยกเลิก'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('ออกจากระบบ'),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (ok != true) return;
+
     try {
       await _sb?.auth.signOut();
     } catch (_) {}
@@ -1396,11 +1223,8 @@ class _HomePageState extends State<HomePage> {
     Future<void> go(Widget page) async {
       Navigator.pop(context);
       final res = await Navigator.of(context).push(MaterialPageRoute(builder: (_) => page));
-      if (res == true && mounted) {
-        _bootstrap();
-      } else {
-        if (mounted) _bootstrap();
-      }
+      if (mounted) _bootstrap();
+      if (res == true && mounted) _bootstrap();
     }
 
     return Drawer(
@@ -1418,18 +1242,18 @@ class _HomePageState extends State<HomePage> {
               child: Row(
                 children: [
                   CircleAvatar(
-  radius: 24,
-  backgroundColor: Colors.white.withOpacity(0.18),
-  backgroundImage: logoProvider,
-  onBackgroundImageError: logoProvider == null
-      ? null
-      : (_, __) {
-          if (mounted) setState(() => _logoUrl = null);
-        },
-  child: logoProvider == null
-      ? const Icon(Icons.store_rounded, color: Colors.white)
-      : null,
-),
+                    radius: 24,
+                    backgroundColor: Colors.white.withOpacity(0.18),
+                    backgroundImage: logoProvider,
+                    onBackgroundImageError: logoProvider == null
+                        ? null
+                        : (_, __) {
+                            if (mounted) setState(() => _logoUrl = null);
+                          },
+                    child: logoProvider == null
+                        ? const Icon(Icons.store_rounded, color: Colors.white)
+                        : null,
+                  ),
                   const SizedBox(width: 12),
                   Expanded(
                     child: Column(
@@ -1454,61 +1278,10 @@ class _HomePageState extends State<HomePage> {
                 ],
               ),
             ),
-
             Expanded(
               child: ListView(
                 padding: const EdgeInsets.symmetric(vertical: 8),
                 children: [
-                  _drawerSectionTitle('การใช้งานหลัก'),
-                  ListTile(
-                    leading: const Icon(Icons.add_circle_outline_rounded),
-                    title: const Text('เพิ่มยา'),
-                    onTap: () async {
-                      Navigator.pop(context);
-                      final ok = await Navigator.of(context).push<bool>(
-                        MaterialPageRoute(builder: (_) => const AddDrugPage()),
-                      );
-                      if (ok == true && mounted) _bootstrap();
-                    },
-                  ),
-                  ListTile(
-                    leading: const Icon(Icons.call_received_rounded),
-                    title: const Text('รับเข้า (Stock In)'),
-                    onTap: () async {
-                      Navigator.pop(context);
-                      await Navigator.of(context).push(
-                        MaterialPageRoute(builder: (_) => const StockInPage()),
-                      );
-                      if (mounted) _bootstrap();
-                    },
-                  ),
-                  ListTile(
-                    leading: const Icon(Icons.call_made_rounded),
-                    title: const Text('จ่ายออก (Stock Out)'),
-                    onTap: () async {
-                      Navigator.pop(context);
-                      await Navigator.of(context).push(
-                        MaterialPageRoute(builder: (_) => const StockOutPage()),
-                      );
-                      if (mounted) _bootstrap();
-                    },
-                  ),
-                  ListTile(
-                    leading: const Icon(Icons.calendar_month_rounded),
-                    title: const Text('ปฏิทินหมดอายุ'),
-                    onTap: () => go(const ExpiryCalendarPage()),
-                  ),
-                  ListTile(
-                    leading: const Icon(Icons.refresh_rounded),
-                    title: const Text('รีเฟรชข้อมูล'),
-                    onTap: () async {
-                      Navigator.pop(context);
-                      await _bootstrap();
-                    },
-                  ),
-
-                  const Divider(height: 22),
-
                   _drawerSectionTitle('โปรไฟล์ & ระบบ'),
                   ListTile(
                     leading: const Icon(Icons.person_rounded),
@@ -1528,15 +1301,18 @@ class _HomePageState extends State<HomePage> {
                     subtitle: const Text('เวอร์ชัน • ผู้พัฒนา • ช่องทางติดต่อ'),
                     onTap: () => go(const AboutPage()),
                   ),
-
-                  const Divider(height: 22),
-
-                  /*ListTile(
-                    leading: const Icon(Icons.logout_rounded, color: Colors.red),
-                    title: const Text('ออกจากระบบ', style: TextStyle(color: Colors.red)),
-                    onTap: _logout,
-                  ),*/
                 ],
+              ),
+            ),
+            const Divider(height: 1),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(10, 6, 10, 10),
+              child: ListTile(
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                leading: const Icon(Icons.logout_rounded, color: Colors.red),
+                title: const Text('ออกจากระบบ',
+                    style: TextStyle(color: Colors.red, fontWeight: FontWeight.w900)),
+                onTap: _logout,
               ),
             ),
           ],
@@ -1583,13 +1359,17 @@ class _HomePageState extends State<HomePage> {
 
     return Scaffold(
       drawer: _buildDrawer(context),
+
+      // ✅ พื้นหลังฟุ้งสวย (คงไว้)
       backgroundColor: const Color(0xFFF4F7FB),
+
       body: RefreshIndicator(
         onRefresh: _bootstrap,
         child: ListView(
+          controller: _scrollCtl,
           padding: const EdgeInsets.all(16),
           children: [
-            // ================= HERO =================
+            // ================= HERO (ยังสวยได้) =================
             Container(
               padding: const EdgeInsets.all(18),
               decoration: BoxDecoration(
@@ -1597,10 +1377,11 @@ class _HomePageState extends State<HomePage> {
                 gradient: LinearGradient(
                   colors: [cs.primary, cs.primary.withOpacity(0.78)],
                 ),
+                // ✅ เงาของ HERO ได้ (ไม่ใช่ฟุ้งที่ panel)
                 boxShadow: [
                   BoxShadow(
-                    color: cs.primary.withOpacity(0.25),
-                    blurRadius: 20,
+                    color: cs.primary.withOpacity(0.20),
+                    blurRadius: 18,
                     offset: const Offset(0, 10),
                   ),
                 ],
@@ -1608,7 +1389,6 @@ class _HomePageState extends State<HomePage> {
               child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                 Row(
                   children: [
-                    // ✅ Hamburger button
                     Builder(
                       builder: (ctx) => IconButton(
                         tooltip: 'เมนู',
@@ -1617,7 +1397,7 @@ class _HomePageState extends State<HomePage> {
                       ),
                     ),
 
-                    // ✅ (optional) ใช้โลโก้ใน hero ด้วย
+                    // logo
                     Builder(builder: (_) {
                       final heroLogo = _homeLogoProvider();
                       return Container(
@@ -1644,7 +1424,7 @@ class _HomePageState extends State<HomePage> {
                     Expanded(
                       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                         const Text(
-                          'PharmaStock Dashboard',
+                          'Dashboard',
                           style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.w900),
                         ),
                         Text(
@@ -1667,6 +1447,27 @@ class _HomePageState extends State<HomePage> {
                       ]),
                     ),
 
+                    // ✅ icon buttons beside calendar
+                    IconButton(
+                      tooltip: 'ผู้ผลิต',
+                      onPressed: () async {
+                        await Navigator.of(context).push(
+                          MaterialPageRoute(builder: (_) => const ManufacturersPage()),
+                        );
+                        if (mounted) _bootstrap();
+                      },
+                      icon: const Icon(Icons.domain_rounded, color: Colors.white),
+                    ),
+                    IconButton(
+                      tooltip: 'Supplier',
+                      onPressed: () async {
+                        await Navigator.of(context).push(
+                          MaterialPageRoute(builder: (_) => const SuppliersPage()),
+                        );
+                        if (mounted) _bootstrap();
+                      },
+                      icon: const Icon(Icons.store_rounded, color: Colors.white),
+                    ),
                     IconButton(
                       tooltip: 'ปฏิทินหมดอายุ',
                       onPressed: () async {
@@ -1685,40 +1486,16 @@ class _HomePageState extends State<HomePage> {
                   ],
                 ),
                 const SizedBox(height: 14),
-                Wrap(
-                  spacing: 10,
-                  runSpacing: 10,
-                  children: [
-                    _quickBtn(context, Icons.add_rounded, 'เพิ่มยา', () async {
-                      final ok = await Navigator.of(context).push<bool>(
-                        MaterialPageRoute(builder: (_) => const AddDrugPage()),
-                      );
-                      if (ok == true && mounted) _bootstrap();
-                    }),
-                    _quickBtn(context, Icons.call_received_rounded, 'รับเข้า', () async {
-                      await Navigator.of(context).push(
-                        MaterialPageRoute(builder: (_) => const StockInPage()),
-                      );
-                      if (mounted) _bootstrap();
-                    }),
-                    _quickBtn(context, Icons.call_made_rounded, 'จ่ายออก', () async {
-                      await Navigator.of(context).push(
-                        MaterialPageRoute(builder: (_) => const StockOutPage()),
-                      );
-                      if (mounted) _bootstrap();
-                    }),
-                  ],
-                ),
               ]),
             ),
 
             const SizedBox(height: 14),
 
-            // ✅ แจ้งเตือนสำคัญ (กดดูรายละเอียดได้)
-            if (_expiredCount > 0 || _nearExpireCount > 0 || _lowStockCount > 0)
-              _panel(
-                title: 'แจ้งเตือนสำคัญ',
-                icon: Icons.notifications_active_rounded,
+            // ✅ แจ้งเตือน: วันหมดอายุ (ไม่มีฟุ้ง)
+            if (_expiredCount > 0 || _nearExpireCount > 0)
+              _panelNoFuzz(
+                title: 'แจ้งเตือน: วันหมดอายุ',
+                icon: Icons.schedule_rounded,
                 child: Column(
                   children: [
                     if (_expiredCount > 0)
@@ -1735,12 +1512,32 @@ class _HomePageState extends State<HomePage> {
                         Colors.orange,
                         onTap: () => _openAlertSheet(_AlertType.nearExpire),
                       ),
+                  ],
+                ),
+              ),
+
+            if (_expiredCount > 0 || _nearExpireCount > 0) const SizedBox(height: 12),
+
+            // ✅ แจ้งเตือน: สต็อกสินค้า (ไม่มีฟุ้ง)
+            if (_lowStockCount > 0 || _outStockCount > 0)
+              _panelNoFuzz(
+                title: 'แจ้งเตือน: สต็อกสินค้า',
+                icon: Icons.inventory_2_rounded,
+                child: Column(
+                  children: [
                     if (_lowStockCount > 0)
                       _alertRow(
                         Icons.inventory_2_rounded,
-                        'ยาสต็อกต่ำ/หมด $_lowStockCount รายการ',
+                        'ยาสต็อกต่ำ $_lowStockCount รายการ',
                         Colors.deepOrange,
                         onTap: () => _openAlertSheet(_AlertType.lowStock),
+                      ),
+                    if (_outStockCount > 0)
+                      _alertRow(
+                        Icons.remove_shopping_cart_rounded,
+                        'ยาไม่มีสต็อก $_outStockCount รายการ',
+                        Colors.redAccent,
+                        onTap: () => _openAlertSheet(_AlertType.outStock),
                       ),
                   ],
                 ),
@@ -1748,7 +1545,7 @@ class _HomePageState extends State<HomePage> {
 
             const SizedBox(height: 12),
 
-            // ================= KPI GRID =================
+            // ================= KPI GRID (ไม่มีฟุ้ง) =================
             LayoutBuilder(
               builder: (context, c) {
                 final wide = c.maxWidth >= 760;
@@ -1759,7 +1556,7 @@ class _HomePageState extends State<HomePage> {
                   children: [
                     SizedBox(
                       width: w,
-                      child: _statCard(
+                      child: _statCardNoFuzz(
                         title: 'ยาในระบบ',
                         value: '$_drugCount',
                         sub: 'จำนวนรายการยา (master)',
@@ -1769,7 +1566,7 @@ class _HomePageState extends State<HomePage> {
                     ),
                     SizedBox(
                       width: w,
-                      child: _statCard(
+                      child: _statCardNoFuzz(
                         title: 'ล็อตที่มีของ',
                         value: '$_lotCount',
                         sub: 'นับเฉพาะล็อตคงเหลือ > 0',
@@ -1779,7 +1576,7 @@ class _HomePageState extends State<HomePage> {
                     ),
                     SizedBox(
                       width: w,
-                      child: _statCard(
+                      child: _statCardNoFuzz(
                         title: 'คงเหลือรวม',
                         value: _onHandBaseTotal.toStringAsFixed(0),
                         sub: 'รวมหน่วยฐานทุกล็อต',
@@ -1789,7 +1586,7 @@ class _HomePageState extends State<HomePage> {
                     ),
                     SizedBox(
                       width: w,
-                      child: _statCard(
+                      child: _statCardNoFuzz(
                         title: 'กำไรโดยประมาณ',
                         value: '${_money(_profitEst)} ฿',
                         sub: 'ช่วง $_days วันล่าสุด',
@@ -1804,16 +1601,19 @@ class _HomePageState extends State<HomePage> {
 
             const SizedBox(height: 12),
 
-            _panel(
+            // ✅ ภาพรวมล็อต (ไม่มีฟุ้ง)
+            _panelNoFuzz(
               title: 'ภาพรวมล็อต (ปกติ/ใกล้หมด/หมดอายุ)',
               icon: Icons.pie_chart_rounded,
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    'คงเหลือรวม (หน่วยฐาน): ${_onHandBaseTotal.toStringAsFixed(2)} • ยาที่ต้องดูแล (low/out): $_lowStockCount',
+                    'คงเหลือรวม (หน่วยฐาน): ${_onHandBaseTotal.toStringAsFixed(2)} • ยาสต็อกต่ำ: $_lowStockCount • ยาไม่มีสต็อก: $_outStockCount',
                     style: TextStyle(color: Colors.black.withOpacity(0.55)),
                   ),
+                  const SizedBox(height: 10),
+                  _onHandByUnitChips(context),
                   const SizedBox(height: 12),
                   _statusBar(
                     ok: okLots,
@@ -1837,7 +1637,8 @@ class _HomePageState extends State<HomePage> {
 
             const SizedBox(height: 12),
 
-            _panel(
+            // ✅ กราฟ (ไม่มีฟุ้ง)
+            _panelNoFuzz(
               title: '📊 กราฟเส้นยอดขาย',
               icon: Icons.show_chart_rounded,
               trailing: Row(
@@ -1862,7 +1663,9 @@ class _HomePageState extends State<HomePage> {
                     height: 180,
                     width: double.infinity,
                     child: _salesSeries.isEmpty
-                        ? Center(child: Text('ยังไม่มีข้อมูลยอดขาย', style: TextStyle(color: Colors.black.withOpacity(0.55))))
+                        ? Center(
+                            child: Text('ยังไม่มีข้อมูลยอดขาย',
+                                style: TextStyle(color: Colors.black.withOpacity(0.55))))
                         : _LineChart(points: _salesSeries),
                   ),
                 ],
@@ -1871,157 +1674,56 @@ class _HomePageState extends State<HomePage> {
 
             const SizedBox(height: 12),
 
-            _panel(
-              title: '📦 Top 5 ยาขายดี',
-              icon: Icons.leaderboard_rounded,
-              child: _top5.isEmpty
-                  ? Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 8),
-                      child: Text('ยังไม่มีข้อมูลการขายในช่วงนี้', style: TextStyle(color: Colors.black.withOpacity(0.55))),
-                    )
-                  : Column(
-                      children: List.generate(_top5.length, (i) {
-                        final t = _top5[i];
-                        return _topRow(rank: i + 1, t: t);
-                      }),
-                    ),
-            ),
-
-            const SizedBox(height: 12),
-
-            _panel(
-              title: '🏭 บริษัทผู้ผลิต',
-              icon: Icons.domain_rounded,
-              trailing: FilledButton.icon(
-                onPressed: () => _showManufacturerEditor(),
-                icon: const Icon(Icons.add_rounded),
-                label: const Text('เพิ่ม'),
-              ),
-              child: Column(
+            // ✅ Top 10 (ไม่มีฟุ้ง)
+            _panelNoFuzz(
+              title: '🏆 Top 10 สินค้าขายดี',
+              icon: Icons.stars_rounded,
+              trailing: Row(
+                mainAxisSize: MainAxisSize.min,
                 children: [
-                  TextField(
-                    controller: _mSearchCtl,
-                    decoration: _dec('ค้นหาผู้ผลิต (ชื่อ/ประเทศ/โทร/อย./รหัส)', icon: Icons.search_rounded).copyWith(
-                      suffixIcon: _mQ.isEmpty
-                          ? null
-                          : IconButton(
-                              icon: const Icon(Icons.close_rounded),
-                              onPressed: () => _mSearchCtl.clear(),
-                            ),
-                    ),
+                  ChoiceChip(
+                    label: const Text('รายวัน'),
+                    selected: _topMode == 0,
+                    onSelected: (_) => setState(() => _topMode = 0),
                   ),
-                  const SizedBox(height: 12),
-                  if (_filteredManufacturers.isEmpty)
-                    Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 12),
-                      child: Text('ยังไม่มีข้อมูลผู้ผลิต', style: TextStyle(color: Colors.black.withOpacity(0.55))),
-                    )
-                  else
-                    Column(
-                      children: List.generate(_filteredManufacturers.length, (i) {
-                        final m = _filteredManufacturers[i];
-                        return _entityTile(
-                          leadingIcon: Icons.domain_rounded,
-                          title: (m['name'] ?? '-').toString(),
-                          badgeText: ((m['code'] ?? '').toString().trim().isEmpty) ? null : (m['code'] ?? '').toString(),
-                          subtitleLines: [
-                            'ประเทศ: ${_safeLine((m['country'] ?? '').toString())}',
-                            'โทร: ${_safeLine((m['phone'] ?? '').toString())}',
-                            'อย.: ${_safeLine((m['fda_number'] ?? '').toString())}',
-                            'ที่อยู่: ${_safeLine((m['address'] ?? '').toString())}',
-                          ],
-                          onTap: () => _showManufacturerEditor(edit: m),
-                        );
-                      }),
-                    ),
+                  const SizedBox(width: 8),
+                  ChoiceChip(
+                    label: const Text('รายเดือน'),
+                    selected: _topMode == 1,
+                    onSelected: (_) => setState(() => _topMode = 1),
+                  ),
                 ],
               ),
-            ),
+              child: Builder(builder: (_) {
+                final list = _topMode == 0 ? _top10Daily : _top10Monthly;
+                final subtitle = _topMode == 0 ? 'วันนี้' : 'เดือนนี้';
 
-            const SizedBox(height: 12),
+                if (list.isEmpty) {
+                  return Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 8),
+                    child: Text('ยังไม่มีข้อมูลการขาย ($subtitle)',
+                        style: TextStyle(color: Colors.black.withOpacity(0.55))),
+                  );
+                }
 
-            _panel(
-              title: '🚚 Supplier',
-              icon: Icons.store_rounded,
-              trailing: FilledButton.icon(
-                onPressed: () => _showSupplierEditor(),
-                icon: const Icon(Icons.add_rounded),
-                label: const Text('เพิ่ม'),
-              ),
-              child: Column(
-                children: [
-                  TextField(
-                    controller: _sSearchCtl,
-                    decoration: _dec('ค้นหา Supplier (ชื่อ/บริษัท/ผู้ติดต่อ/โทร/Line/Email/ใบอนุญาต)', icon: Icons.search_rounded)
-                        .copyWith(
-                      suffixIcon: _sQ.isEmpty
-                          ? null
-                          : IconButton(
-                              icon: const Icon(Icons.close_rounded),
-                              onPressed: () => _sSearchCtl.clear(),
-                            ),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  if (_filteredSuppliers.isEmpty)
-                    Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 12),
-                      child: Text('ยังไม่มีข้อมูล Supplier', style: TextStyle(color: Colors.black.withOpacity(0.55))),
-                    )
-                  else
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('สรุป $subtitle',
+                        style: TextStyle(
+                            color: Colors.black.withOpacity(0.65),
+                            fontWeight: FontWeight.w700)),
+                    const SizedBox(height: 10),
                     Column(
-                      children: List.generate(_filteredSuppliers.length, (i) {
-                        final s = _filteredSuppliers[i];
-                        final isDefault = s['is_default'] == true;
-                        final isActive = (s['is_active'] == null) ? true : (s['is_active'] == true);
-
-                        final title = (s['name'] ?? '-').toString();
-                        final company = (s['company_name'] ?? '').toString().trim();
-                        final contact = (s['contact_name'] ?? '').toString().trim();
-                        final phone = (s['phone'] ?? '').toString().trim();
-                        final lineId = (s['line_id'] ?? '').toString().trim();
-                        final email = (s['email'] ?? '').toString().trim();
-                        final delivery = (s['delivery_area'] ?? '').toString().trim();
-                        final reg = (s['company_reg_no'] ?? '').toString().trim();
-                        final lic = (s['drug_license_no'] ?? '').toString().trim();
-
-                        return _entityTile(
-                          leadingIcon: isDefault ? Icons.star_rounded : Icons.storefront_rounded,
-                          leadingColor: isDefault ? Colors.amber.shade700 : null,
-                          title: title,
-                          badgeText: isDefault
-                              ? 'DEFAULT'
-                              : (((s['code'] ?? '').toString().trim().isEmpty) ? null : (s['code'] ?? '').toString()),
-                          badgeTone: isDefault ? Colors.amber : null,
-                          subtitleLines: [
-                            'สถานะ: ${isActive ? 'เปิดใช้งาน' : 'ปิดใช้งาน'}',
-                            if (company.isNotEmpty) 'บริษัท: $company',
-                            if (contact.isNotEmpty) 'ผู้ติดต่อ: $contact',
-                            if (phone.isNotEmpty) 'โทร: $phone',
-                            if (lineId.isNotEmpty) 'Line: $lineId',
-                            if (email.isNotEmpty) 'Email: $email',
-                            if (delivery.isNotEmpty) 'พื้นที่จัดส่ง: $delivery',
-                            if (reg.isNotEmpty) 'ทะเบียนบริษัท: $reg',
-                            if (lic.isNotEmpty) 'ใบอนุญาตยา: $lic',
-                            if (company.isEmpty &&
-                                contact.isEmpty &&
-                                phone.isEmpty &&
-                                lineId.isEmpty &&
-                                email.isEmpty &&
-                                delivery.isEmpty &&
-                                reg.isEmpty &&
-                                lic.isEmpty)
-                              'รายละเอียด: -',
-                          ],
-                          onTap: () => _showSupplierEditor(edit: s),
-                        );
+                      children: List.generate(list.length, (i) {
+                        final t = list[i];
+                        return _topRowNoFuzz(rank: i + 1, t: t);
                       }),
                     ),
-                ],
-              ),
+                  ],
+                );
+              }),
             ),
-
-            const SizedBox(height: 18),
           ],
         ),
       ),
@@ -2029,154 +1731,60 @@ class _HomePageState extends State<HomePage> {
   }
 
   // =========================
-  // Widgets
+  // ✅ PANEL แบบ "ไม่ฟุ้ง" (สำคัญ)
   // =========================
-  Widget _panel({
+  Widget _panelNoFuzz({
     required String title,
     required IconData icon,
     required Widget child,
     Widget? trailing,
   }) {
-    return Card(
-      elevation: 0,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Row(
-            children: [
-              Icon(icon),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  title,
-                  style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w900),
-                ),
-              ),
-              if (trailing != null) trailing,
-            ],
-          ),
-          const SizedBox(height: 12),
-          child,
-        ]),
-      ),
-    );
-  }
-
-  Widget _entityTile({
-    required IconData leadingIcon,
-    Color? leadingColor,
-    required String title,
-    String? badgeText,
-    Color? badgeTone,
-    required List<String> subtitleLines,
-    required VoidCallback onTap,
-  }) {
     final cs = Theme.of(context).colorScheme;
-    final tone = badgeTone ?? cs.primary;
 
-    return Container(
-      margin: const EdgeInsets.only(bottom: 10),
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: Colors.black.withOpacity(0.08)),
-        color: Colors.white,
-      ),
-      child: InkWell(
-        onTap: onTap,
-        borderRadius: BorderRadius.circular(16),
-        child: Padding(
-          padding: const EdgeInsets.all(12),
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Container(
-                width: 40,
-                height: 40,
-                decoration: BoxDecoration(
-                  color: (leadingColor ?? cs.primary).withOpacity(0.12),
-                  borderRadius: BorderRadius.circular(14),
-                ),
-                child: Icon(leadingIcon, color: leadingColor ?? cs.primary),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                  Row(
-                    children: [
-                      Expanded(
-                        child: Text(
-                          title,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(fontWeight: FontWeight.w900),
-                        ),
-                      ),
-                      if (badgeText != null && badgeText.trim().isNotEmpty)
-                        Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                          decoration: BoxDecoration(
-                            borderRadius: BorderRadius.circular(999),
-                            color: tone.withOpacity(0.12),
-                            border: Border.all(color: tone.withOpacity(0.25)),
-                          ),
-                          child: Text(
-                            badgeText,
-                            style: TextStyle(fontWeight: FontWeight.w900, color: tone, fontSize: 12),
-                          ),
-                        ),
-                    ],
-                  ),
-                  const SizedBox(height: 6),
-                  for (final l in subtitleLines.take(6))
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 2),
-                      child: Text(
-                        l,
-                        style: TextStyle(color: Colors.black.withOpacity(0.65), fontWeight: FontWeight.w600, height: 1.25),
-                      ),
-                    ),
-                  const SizedBox(height: 6),
-                  Row(
-                    children: [
-                      Icon(Icons.edit_rounded, size: 16, color: cs.primary.withOpacity(0.9)),
-                      const SizedBox(width: 6),
-                      Text('แตะเพื่อแก้ไข', style: TextStyle(color: cs.primary.withOpacity(0.9), fontWeight: FontWeight.w800)),
-                    ],
-                  )
-                ]),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _quickBtn(BuildContext context, IconData icon, String text, VoidCallback onTap) {
-    final cs = Theme.of(context).colorScheme;
-    return InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(14),
+    return Material(
+      color: Colors.transparent,
       child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
         decoration: BoxDecoration(
-          color: Colors.white.withOpacity(0.15),
-          borderRadius: BorderRadius.circular(14),
-          border: Border.all(color: Colors.white.withOpacity(0.22)),
+          color: Colors.white, // ✅ พื้นขาวล้วน
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(color: Colors.black.withOpacity(0.06)),
+          // ✅ เงาแบบคม ไม่ฟุ้ง (blur ต่ำ)
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withOpacity(0.03),
+              blurRadius: 10,
+              offset: const Offset(0, 6),
+            ),
+          ],
         ),
-        child: Row(mainAxisSize: MainAxisSize.min, children: [
-          Icon(icon, color: Colors.white),
-          const SizedBox(width: 8),
-          Text(text, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w700)),
-          const SizedBox(width: 2),
-          Icon(Icons.chevron_right_rounded, color: cs.onPrimary.withOpacity(0.9), size: 18),
-        ]),
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Row(
+              children: [
+                Icon(icon, color: cs.primary),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    title,
+                    style: Theme.of(context)
+                        .textTheme
+                        .titleMedium
+                        ?.copyWith(fontWeight: FontWeight.w900),
+                  ),
+                ),
+                if (trailing != null) trailing,
+              ],
+            ),
+            const SizedBox(height: 12),
+            child,
+          ]),
+        ),
       ),
     );
   }
 
-  // ✅ ทำให้แถวแจ้งเตือน "กดได้"
+  // ✅ ทำให้แถวแจ้งเตือน "กดได้" (ไม่มีฟุ้ง)
   Widget _alertRow(IconData icon, String text, Color c, {VoidCallback? onTap}) {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 4),
@@ -2218,16 +1826,27 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  Widget _statCard({
+  // ✅ สถิติ: ทำเป็นกล่องขาว + เงาคม (ไม่ฟุ้ง)
+  Widget _statCardNoFuzz({
     required String title,
     required String value,
     required String sub,
     required IconData icon,
     required Color tone,
   }) {
-    return Card(
-      elevation: 0,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: Colors.black.withOpacity(0.06)),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.03),
+            blurRadius: 10,
+            offset: const Offset(0, 6),
+          ),
+        ],
+      ),
       child: Padding(
         padding: const EdgeInsets.all(16),
         child: Row(
@@ -2285,7 +1904,8 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  Widget _topRow({required int rank, required _TopDrug t}) {
+  // ✅ top row: กล่องขาว + เงาคม ไม่ฟุ้ง
+  Widget _topRowNoFuzz({required int rank, required _TopDrug t}) {
     final cs = Theme.of(context).colorScheme;
     final badge = rank == 1
         ? Colors.amber
@@ -2296,8 +1916,15 @@ class _HomePageState extends State<HomePage> {
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: Theme.of(context).dividerColor),
+        border: Border.all(color: Colors.black.withOpacity(0.06)),
         color: Colors.white,
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.03),
+            blurRadius: 10,
+            offset: const Offset(0, 6),
+          ),
+        ],
       ),
       child: Row(
         children: [
@@ -2432,9 +2059,9 @@ class _LineChartPainter extends CustomPainter {
 }
 
 // =========================
-// Alert Models (NEW)
+// Alert Models
 // =========================
-enum _AlertType { expired, nearExpire, lowStock }
+enum _AlertType { expired, nearExpire, lowStock, outStock }
 
 class _DrugInfo {
   final String drugId;
@@ -2492,13 +2119,13 @@ class _DrugAlertGroup {
 
   DateTime get nextExpDate {
     if (lots.isEmpty) return DateTime(2100);
-    lots.sort((a, b) => a.expDate.compareTo(b.expDate));
-    return lots.first.expDate;
+    final tmp = [...lots]..sort((a, b) => a.expDate.compareTo(b.expDate));
+    return tmp.first.expDate;
   }
 }
 
 // =========================
-// Top Models (เดิม)
+// Top Models
 // =========================
 class _TopDrugAgg {
   final String drugId;

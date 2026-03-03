@@ -20,7 +20,6 @@ class _AddDrugPageState extends State<AddDrugPage> {
   late final DrugsRepository repo = DrugsRepository(Supabase.instance.client);
   final SupabaseClient _supabase = Supabase.instance.client;
 
-  // ✅ ตารางผู้ผลิตตัวจริง
   static const String _manufacturersTable = 'manufacturers';
 
   // master
@@ -64,7 +63,6 @@ class _AddDrugPageState extends State<AddDrugPage> {
     super.initState();
     _applyBaseUnitAsDefault();
 
-    // ✅ กัน race condition: ให้โหลด manufacturers ก่อน แล้วค่อยโหลด edit
     Future.microtask(() async {
       await _loadManufacturers();
       if (_isEdit) {
@@ -80,7 +78,6 @@ class _AddDrugPageState extends State<AddDrugPage> {
     return uid;
   }
 
-  // ✅ FIX: information_schema อาจโดน RLS/permission => ต้อง fail-safe
   Future<bool> _hasColumn(String table, String column) async {
     try {
       final rows = await _supabase
@@ -92,21 +89,16 @@ class _AddDrugPageState extends State<AddDrugPage> {
           .limit(1);
       return (rows as List).isNotEmpty;
     } catch (_) {
-      // ถ้าอ่านไม่ได้ ให้ถือว่า "ไม่มีคอลัมน์" ไปเลย (ไม่ทำให้โหลด list พัง)
       return false;
     }
   }
 
-  // ✅ โหลดรายชื่อผู้ผลิตจาก manufacturers (ผูกตาม owner_id)
   Future<void> _loadManufacturers() async {
     if (!mounted) return;
     setState(() => _isLoadingManufacturers = true);
 
     try {
       final uid = _requireUid();
-
-      // ✅ manufacturers schema ของคุณไม่มี is_active อยู่แล้ว
-      // แต่เผื่ออนาคตมีเพิ่ม ก็ยังรองรับ (และปลอดภัยเพราะ _hasColumn fail-safe)
       final hasIsActive = await _hasColumn(_manufacturersTable, 'is_active');
 
       var q = _supabase
@@ -115,7 +107,6 @@ class _AddDrugPageState extends State<AddDrugPage> {
           .eq('owner_id', uid);
 
       if (hasIsActive) {
-        // ถ้ามีจริงค่อยกรอง
         q = q.or('is_active.is.null,is_active.eq.true');
       }
 
@@ -178,13 +169,11 @@ class _AddDrugPageState extends State<AddDrugPage> {
       _exampleText.text = (drug['example_text'] ?? '').toString();
       _autoDispenseLabel.text = (drug['auto_dispense_label'] ?? '').toString();
 
-      // ✅ โหลดหน่วยจ่ายจาก DB
       final rows = await repo.listDispenseUnits(drugId, onlyActive: false);
 
       final baseName = _baseUnit.trim();
       final temp = <_DispenseUnitDraft>[];
 
-      // base unit (ล็อก)
       temp.add(_DispenseUnitDraft(
         unitName: baseName.isEmpty ? 'หน่วยฐาน' : baseName,
         toBase: 1,
@@ -193,7 +182,6 @@ class _AddDrugPageState extends State<AddDrugPage> {
         isActive: true,
       ));
 
-      // units จาก DB
       for (final r in rows) {
         final name = (r['unit_name'] ?? '').toString().trim();
         if (name.isEmpty) continue;
@@ -593,7 +581,6 @@ class _AddDrugPageState extends State<AddDrugPage> {
     );
   }
 
-  // 🌟 Dialog เพิ่มผู้ผลิตใหม่ (เพิ่ม: address + fda_number)
   void _showAddManufacturerDialog() {
     final formKey = GlobalKey<FormState>();
     final mName = TextEditingController();
@@ -629,7 +616,7 @@ class _AddDrugPageState extends State<AddDrugPage> {
                       TextFormField(
                         controller: mName,
                         decoration: _customInputDecoration('ชื่อบริษัท / องค์กร *'),
-                        validator: (v) => v!.trim().isEmpty ? 'กรุณากรอกชื่อ' : null,
+                        validator: (v) => (v ?? '').trim().isEmpty ? 'กรุณากรอกชื่อ' : null,
                       ),
                       const SizedBox(height: 12),
                       TextFormField(
@@ -673,7 +660,7 @@ class _AddDrugPageState extends State<AddDrugPage> {
                             final uid = _requireUid();
 
                             final payload = <String, dynamic>{
-                              'owner_id': uid, // ✅ ผูกตาม user
+                              'owner_id': uid,
                               'name': mName.text.trim(),
                               'country': mCountry.text.trim().isEmpty ? null : mCountry.text.trim(),
                               'address': mAddress.text.trim().isEmpty ? null : mAddress.text.trim(),
@@ -723,38 +710,71 @@ class _AddDrugPageState extends State<AddDrugPage> {
     );
   }
 
-  Future<void> _submit() async {
+  // ✅ เพิ่มเช็ค “กรอกครบ” ก่อนบันทึก
+  bool _validateBeforeSubmit() {
+    // 1) validate ฟอร์ม
     final ok = _formKey.currentState?.validate() ?? false;
-    if (!ok) return;
-    if (_saving) return;
+    if (!ok) return false;
 
+    // 2) เช็คผู้ผลิต (บังคับ)
+    final mName = (_selectedManufacturer?['name'] ?? '').toString().trim();
+    if (mName.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('กรุณาเลือก “บริษัทผู้ผลิต”')),
+      );
+      return false;
+    }
+
+    // 3) เช็ค pack & conversion ให้ครบและถูกต้อง
+    final pUnit = _packUnit.text.trim();
+    final pToBase = _tryNum(_packToBase.text) ?? 0;
+    if (pUnit.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('กรุณากรอก “หน่วยบรรจุ (Pack)”')),
+      );
+      return false;
+    }
+    if (pToBase <= 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('กรุณากรอก “1 หน่วยบรรจุ = กี่หน่วยฐาน” ให้มากกว่า 0')),
+      );
+      return false;
+    }
+
+    // 4) เช็คหน่วยจ่าย
     if (_units.isEmpty || !_units.any((u) => u.isDefault)) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('กรุณามีหน่วยจ่ายอย่างน้อย 1 หน่วย และตั้งค่า Default')),
       );
-      return;
+      return false;
     }
-
-    final anyActive = _units.any((u) => u.isActive);
-    if (!anyActive) {
+    if (!_units.any((u) => u.isActive)) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('ต้องมีอย่างน้อย 1 หน่วยที่ “เปิดใช้งาน”')),
       );
-      return;
+      return false;
     }
+
+    return true;
+  }
+
+  Future<void> _submit() async {
+    if (_saving) return;
+
+    // ✅ ใช้ตัว validate ใหม่
+    if (!_validateBeforeSubmit()) return;
 
     setState(() => _saving = true);
     await _showLoading();
 
     try {
       final code = _code.text.trim().isEmpty ? null : _code.text.trim();
-      final packToBase = _tryNum(_packToBase.text);
+      final packToBase = _tryNum(_packToBase.text)!; // ✅ ตอนนี้บังคับแล้ว
       final reorderPoint = _tryNum(_reorderPoint.text) ?? 0;
       final expiryDays = _tryInt(_expiryAlertDays.text) ?? 90;
 
-      // ✅ ยังเก็บเป็นชื่อผู้ผลิตบนตาราง drugs เหมือนเดิม
       final manufacturerNameToSave =
-          _selectedManufacturer != null ? (_selectedManufacturer!['name']?.toString()) : null;
+          (_selectedManufacturer?['name'] ?? '').toString().trim();
 
       final units = _units.map((u) {
         return DispenseUnitInput(
@@ -770,48 +790,63 @@ class _AddDrugPageState extends State<AddDrugPage> {
           drugId: widget.drugId!,
           code: code,
           genericName: _generic.text.trim(),
-          brandName: _brand.text.trim().isEmpty ? null : _brand.text.trim(),
-          dosageForm: _dosageForm.text.trim().isEmpty ? null : _dosageForm.text.trim(),
-          strength: _strength.text.trim().isEmpty ? null : _strength.text.trim(),
+          brandName: _brand.text.trim(),
+          dosageForm: _dosageForm.text.trim(),
+          strength: _strength.text.trim(),
           baseUnit: _baseUnit,
-          packUnit: _packUnit.text.trim().isEmpty ? null : _packUnit.text.trim(),
+          packUnit: _packUnit.text.trim(),
           packToBase: packToBase,
-          category: _category.text.trim().isEmpty ? null : _category.text.trim(),
+          category: _category.text.trim(),
           manufacturer: manufacturerNameToSave,
           status: _status,
           reorderPoint: reorderPoint,
           expiryAlertDays: expiryDays,
-          exampleText: _exampleText.text.trim().isEmpty ? null : _exampleText.text.trim(),
-          autoDispenseLabel: _autoDispenseLabel.text.trim().isEmpty
-              ? null
-              : _autoDispenseLabel.text.trim(),
+          exampleText: _exampleText.text.trim(),
+          autoDispenseLabel: _autoDispenseLabel.text.trim(),
           units: units,
         );
       } else {
         await repo.addDrugWithUnits(
           code: code,
           genericName: _generic.text.trim(),
-          brandName: _brand.text.trim().isEmpty ? null : _brand.text.trim(),
-          dosageForm: _dosageForm.text.trim().isEmpty ? null : _dosageForm.text.trim(),
-          strength: _strength.text.trim().isEmpty ? null : _strength.text.trim(),
+          brandName: _brand.text.trim(),
+          dosageForm: _dosageForm.text.trim(),
+          strength: _strength.text.trim(),
           baseUnit: _baseUnit,
-          packUnit: _packUnit.text.trim().isEmpty ? null : _packUnit.text.trim(),
+          packUnit: _packUnit.text.trim(),
           packToBase: packToBase,
-          category: _category.text.trim().isEmpty ? null : _category.text.trim(),
+          category: _category.text.trim(),
           manufacturer: manufacturerNameToSave,
           status: _status,
           reorderPoint: reorderPoint,
           expiryAlertDays: expiryDays,
-          exampleText: _exampleText.text.trim().isEmpty ? null : _exampleText.text.trim(),
-          autoDispenseLabel: _autoDispenseLabel.text.trim().isEmpty
-              ? null
-              : _autoDispenseLabel.text.trim(),
+          exampleText: _exampleText.text.trim(),
+          autoDispenseLabel: _autoDispenseLabel.text.trim(),
           units: units,
         );
       }
 
       _closeLoading();
       if (!mounted) return;
+
+      final msg = _isEdit ? 'แก้ไขข้อมูลยาเรียบร้อยแล้ว' : 'เพิ่มยาเรียบร้อยแล้ว';
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(
+            content: Row(
+              children: [
+                const Icon(Icons.check_circle_rounded, color: Colors.white),
+                const SizedBox(width: 10),
+                Expanded(child: Text(msg)),
+              ],
+            ),
+            behavior: SnackBarBehavior.floating,
+            duration: const Duration(seconds: 2),
+          ),
+        );
+
+      await Future.delayed(const Duration(milliseconds: 900));
       Navigator.of(context).pop(true);
     } catch (e) {
       _closeLoading();
@@ -843,13 +878,11 @@ class _AddDrugPageState extends State<AddDrugPage> {
       ),
       focusedBorder: OutlineInputBorder(
         borderRadius: BorderRadius.circular(12),
-        borderSide:
-            BorderSide(color: Theme.of(context).colorScheme.primary, width: 2),
+        borderSide: BorderSide(color: Theme.of(context).colorScheme.primary, width: 2),
       ),
       errorBorder: OutlineInputBorder(
         borderRadius: BorderRadius.circular(12),
-        borderSide:
-            BorderSide(color: Theme.of(context).colorScheme.error),
+        borderSide: BorderSide(color: Theme.of(context).colorScheme.error),
       ),
     );
   }
@@ -978,12 +1011,13 @@ class _AddDrugPageState extends State<AddDrugPage> {
                           context,
                           left: TextFormField(
                             controller: _generic,
-                            decoration: _customInputDecoration('ชื่อสามัญ (Generic) เช่น Paracetamol'),
+                            decoration: _customInputDecoration('ชื่อสามัญ (Generic) * เช่น Paracetamol'),
                             validator: (v) => _req(v, 'กรุณากรอกชื่อสามัญ'),
                           ),
                           right: TextFormField(
                             controller: _brand,
-                            decoration: _customInputDecoration('ชื่อการค้า (Brand) (ถ้าไม่มีเว้นว่าง)'),
+                            decoration: _customInputDecoration('ชื่อการค้า (Brand) *'),
+                            validator: (v) => _req(v, 'กรุณากรอกชื่อการค้า'),
                           ),
                         ),
                         const SizedBox(height: 16),
@@ -991,11 +1025,13 @@ class _AddDrugPageState extends State<AddDrugPage> {
                           context,
                           left: TextFormField(
                             controller: _dosageForm,
-                            decoration: _customInputDecoration('รูปแบบยา เช่น เม็ด/แคปซูล/น้ำ'),
+                            decoration: _customInputDecoration('รูปแบบยา * เช่น เม็ด/แคปซูล/น้ำ'),
+                            validator: (v) => _req(v, 'กรุณากรอกรูปแบบยา'),
                           ),
                           right: TextFormField(
                             controller: _strength,
-                            decoration: _customInputDecoration('ความแรง เช่น 500 mg'),
+                            decoration: _customInputDecoration('ความแรง * เช่น 500 mg'),
+                            validator: (v) => _req(v, 'กรุณากรอกความแรง'),
                           ),
                         ),
                       ],
@@ -1012,7 +1048,7 @@ class _AddDrugPageState extends State<AddDrugPage> {
                           context,
                           left: DropdownButtonFormField<String>(
                             value: _baseUnit,
-                            decoration: _customInputDecoration('หน่วยฐาน (Base)'),
+                            decoration: _customInputDecoration('หน่วยฐาน (Base) *'),
                             items: const [
                               DropdownMenuItem(value: 'เม็ด', child: Text('เม็ด')),
                               DropdownMenuItem(value: 'แคปซูล', child: Text('แคปซูล')),
@@ -1020,6 +1056,8 @@ class _AddDrugPageState extends State<AddDrugPage> {
                               DropdownMenuItem(value: 'กรัม', child: Text('กรัม')),
                               DropdownMenuItem(value: 'ขวด', child: Text('ขวด')),
                               DropdownMenuItem(value: 'หลอด', child: Text('หลอด')),
+                              DropdownMenuItem(value: 'ซอง', child: Text('ซอง')),
+                              DropdownMenuItem(value: 'ชิ้น', child: Text('ชิ้น')),
                             ],
                             onChanged: (v) {
                               setState(() => _baseUnit = v ?? 'เม็ด');
@@ -1028,7 +1066,8 @@ class _AddDrugPageState extends State<AddDrugPage> {
                           ),
                           right: TextFormField(
                             controller: _packUnit,
-                            decoration: _customInputDecoration('หน่วยบรรจุ (Pack) เช่น แผง/กล่อง'),
+                            decoration: _customInputDecoration('หน่วยบรรจุ (Pack) * เช่น แผง/กล่อง'),
+                            validator: (v) => _req(v, 'กรุณากรอกหน่วยบรรจุ'),
                           ),
                         ),
                         const SizedBox(height: 16),
@@ -1036,12 +1075,12 @@ class _AddDrugPageState extends State<AddDrugPage> {
                           controller: _packToBase,
                           keyboardType: TextInputType.number,
                           decoration: _customInputDecoration(
-                            '1 หน่วยบรรจุ = กี่หน่วยฐาน (เช่น 1 แผง = 10 เม็ด)',
+                            '1 หน่วยบรรจุ = กี่หน่วยฐาน * (เช่น 1 แผง = 10 เม็ด)',
                             helperText: hint.isEmpty ? null : hint,
                           ),
                           validator: (v) {
                             final t = (v ?? '').trim();
-                            if (t.isEmpty) return null;
+                            if (t.isEmpty) return 'กรุณากรอกจำนวนเทียบหน่วย';
                             final n = num.tryParse(t);
                             if (n == null || n <= 0) return 'กรุณากรอกเป็นตัวเลข > 0';
                             return null;
@@ -1051,7 +1090,7 @@ class _AddDrugPageState extends State<AddDrugPage> {
                     ),
                   ),
 
-                  // 📦 Card 3: การจัดการหน่วยจ่ายยา
+                  // 📦 Card 3: หน่วยจ่าย
                   _buildCard(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
@@ -1130,7 +1169,7 @@ class _AddDrugPageState extends State<AddDrugPage> {
                     ),
                   ),
 
-                  // 📦 Card 4: ข้อมูลเพิ่มเติมและการคลัง
+                  // 📦 Card 4: ข้อมูลเพิ่มเติม & สต็อก
                   _buildCard(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
@@ -1138,11 +1177,12 @@ class _AddDrugPageState extends State<AddDrugPage> {
                         _buildSectionHeader(Icons.assignment_rounded, 'ข้อมูลเพิ่มเติม & สต็อก'),
                         TextFormField(
                           controller: _category,
-                          decoration: _customInputDecoration('หมวดหมู่ยา เช่น แก้ปวด'),
+                          decoration: _customInputDecoration('หมวดหมู่ยา * เช่น แก้ปวด'),
+                          validator: (v) => _req(v, 'กรุณากรอกหมวดหมู่ยา'),
                         ),
                         const SizedBox(height: 16),
 
-                        // ✅ เลือกผู้ผลิต + โชว์รายละเอียด (ที่อยู่/โทร/อย.)
+                        // ผู้ผลิต (บังคับ)
                         InkWell(
                           onTap: _showManufacturerPicker,
                           borderRadius: BorderRadius.circular(12),
@@ -1169,18 +1209,12 @@ class _AddDrugPageState extends State<AddDrugPage> {
                                         : Colors.white,
                                     shape: BoxShape.circle,
                                     boxShadow: selected != null
-                                        ? [
-                                            BoxShadow(
-                                                color: cs.primary.withOpacity(0.1),
-                                                blurRadius: 4)
-                                          ]
+                                        ? [BoxShadow(color: cs.primary.withOpacity(0.1), blurRadius: 4)]
                                         : [],
                                   ),
                                   child: Icon(
                                     Icons.domain_rounded,
-                                    color: selected == null
-                                        ? Colors.grey.shade500
-                                        : cs.primary,
+                                    color: selected == null ? Colors.grey.shade500 : cs.primary,
                                   ),
                                 ),
                                 const SizedBox(width: 16),
@@ -1191,25 +1225,18 @@ class _AddDrugPageState extends State<AddDrugPage> {
                                       Text(
                                         selected != null
                                             ? (selectedName ?? '')
-                                            : 'คลิกเพื่อเลือกบริษัทผู้ผลิต',
+                                            : 'คลิกเพื่อเลือกบริษัทผู้ผลิต *',
                                         style: TextStyle(
                                           fontSize: 16,
-                                          fontWeight: selected != null
-                                              ? FontWeight.bold
-                                              : FontWeight.normal,
-                                          color: selected != null
-                                              ? Colors.black87
-                                              : Colors.grey.shade600,
+                                          fontWeight: selected != null ? FontWeight.bold : FontWeight.normal,
+                                          color: selected != null ? Colors.black87 : Colors.grey.shade600,
                                         ),
                                       ),
                                       if (selected != null) ...[
                                         const SizedBox(height: 6),
                                         Text(
                                           selectedDetailText(),
-                                          style: TextStyle(
-                                              color: Colors.grey.shade700,
-                                              fontSize: 13,
-                                              height: 1.3),
+                                          style: TextStyle(color: Colors.grey.shade700, fontSize: 13, height: 1.3),
                                         ),
                                       ]
                                     ],
@@ -1217,14 +1244,11 @@ class _AddDrugPageState extends State<AddDrugPage> {
                                 ),
                                 if (selected != null)
                                   IconButton(
-                                    icon: const Icon(Icons.close_rounded,
-                                        color: Colors.grey, size: 20),
-                                    onPressed: () =>
-                                        setState(() => _selectedManufacturer = null),
+                                    icon: const Icon(Icons.close_rounded, color: Colors.grey, size: 20),
+                                    onPressed: () => setState(() => _selectedManufacturer = null),
                                   )
                                 else
-                                  Icon(Icons.chevron_right_rounded,
-                                      color: Colors.grey.shade400),
+                                  Icon(Icons.chevron_right_rounded, color: Colors.grey.shade400),
                               ],
                             ),
                           ),
@@ -1235,7 +1259,7 @@ class _AddDrugPageState extends State<AddDrugPage> {
                           context,
                           left: DropdownButtonFormField<String>(
                             value: _status,
-                            decoration: _customInputDecoration('สถานะการใช้งาน'),
+                            decoration: _customInputDecoration('สถานะการใช้งาน *'),
                             items: const [
                               DropdownMenuItem(value: 'active', child: Text('เปิดใช้งาน')),
                               DropdownMenuItem(value: 'inactive', child: Text('ปิดใช้งาน')),
@@ -1250,10 +1274,10 @@ class _AddDrugPageState extends State<AddDrugPage> {
                           left: TextFormField(
                             controller: _reorderPoint,
                             keyboardType: TextInputType.number,
-                            decoration: _customInputDecoration('เตือนสต็อกต่ำ (หน่วยฐาน)'),
+                            decoration: _customInputDecoration('เตือนสต็อกต่ำ (หน่วยฐาน) *'),
                             validator: (v) {
                               final t = (v ?? '').trim();
-                              if (t.isEmpty) return null;
+                              if (t.isEmpty) return 'กรุณากรอกค่าเตือนสต็อกต่ำ';
                               final n = num.tryParse(t);
                               if (n == null || n < 0) return 'กรุณากรอกตัวเลข ≥ 0';
                               return null;
@@ -1262,10 +1286,10 @@ class _AddDrugPageState extends State<AddDrugPage> {
                           right: TextFormField(
                             controller: _expiryAlertDays,
                             keyboardType: TextInputType.number,
-                            decoration: _customInputDecoration('เตือนก่อนหมดอายุ (วัน)'),
+                            decoration: _customInputDecoration('เตือนก่อนหมดอายุ (วัน) *'),
                             validator: (v) {
                               final t = (v ?? '').trim();
-                              if (t.isEmpty) return null;
+                              if (t.isEmpty) return 'กรุณากรอกจำนวนวันเตือนหมดอายุ';
                               final n = int.tryParse(t);
                               if (n == null || n < 0) return 'กรุณากรอกตัวเลข ≥ 0';
                               return null;
@@ -1275,13 +1299,15 @@ class _AddDrugPageState extends State<AddDrugPage> {
                         const SizedBox(height: 16),
                         TextFormField(
                           controller: _exampleText,
-                          decoration: _customInputDecoration('ตัวอย่าง / คำแนะนำวิธีใช้'),
+                          decoration: _customInputDecoration('ตัวอย่าง / คำแนะนำวิธีใช้ *'),
+                          validator: (v) => _req(v, 'กรุณากรอกคำแนะนำวิธีใช้'),
                           maxLines: 2,
                         ),
                         const SizedBox(height: 16),
                         TextFormField(
                           controller: _autoDispenseLabel,
-                          decoration: _customInputDecoration('ตั้งชื่อหน่วยจ่ายอัตโนมัติ (Auto dispense label)'),
+                          decoration: _customInputDecoration('ตั้งชื่อหน่วยจ่ายอัตโนมัติ (Auto dispense label) *'),
+                          validator: (v) => _req(v, 'กรุณากรอก Auto dispense label'),
                         ),
                       ],
                     ),

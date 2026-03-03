@@ -121,7 +121,7 @@ class _LoginPageState extends State<LoginPage> {
                         ),
                         const SizedBox(height: 10),
                         Text(
-                          'ระบบพร้อมรองรับการยืนยันตัวตนอย่างปลอดภัย หากคุณยังไม่มีบัญชี สามารถลงทะเบียนได้ที่หน้า "สมัครสมาชิก"',
+                          'หากคุณยังไม่มีบัญชี สามารถลงทะเบียนได้ที่หน้า "สมัครสมาชิก"',
                           textAlign: TextAlign.center,
                           style: Theme.of(context).textTheme.bodySmall?.copyWith(color: Colors.black45),
                         ),

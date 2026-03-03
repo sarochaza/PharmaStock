@@ -36,9 +36,6 @@ class _RegisterPageState extends State<RegisterPage> {
     if (!RegExp(r'[A-Z]').hasMatch(value)) return 'ต้องมีตัวพิมพ์ใหญ่ (A-Z)';
     if (!RegExp(r'[a-z]').hasMatch(value)) return 'ต้องมีตัวพิมพ์เล็ก (a-z)';
     if (!RegExp(r'[0-9]').hasMatch(value)) return 'ต้องมีตัวเลข (0-9)';
-    if (!RegExp(r'[!@#\$%^&*(),.?":{}|<>]').hasMatch(value)) {
-      return 'ต้องมีอักขระพิเศษ เช่น !@#\$%^&*';
-    }
     return null;
   }
 
@@ -142,7 +139,7 @@ class _RegisterPageState extends State<RegisterPage> {
                           obscureText: _obscure1,
                           decoration: InputDecoration(
                             labelText: 'รหัสผ่าน',
-                            helperText: 'รหัสผ่านต้องมีอย่างน้อย 8 ตัว และประกอบด้วยตัวใหญ่ ตัวเล็ก ตัวเลข และสัญลักษณ์',
+                            helperText: 'รหัสผ่านต้องมีอย่างน้อย 8 ตัว และประกอบด้วยตัวใหญ่ ตัวเล็ก ตัวเลข',
                             suffixIcon: IconButton(
                               onPressed: () =>
                                   setState(() => _obscure1 = !_obscure1),
